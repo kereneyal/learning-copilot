@@ -1,3 +1,22 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node / Next
+node_modules/
+.next/
+
+# Env
+.env
+.env.local
+
+# Local data
+chroma_db/
+storage/
+
+# Backups / archives
 archive/
-*_backup*
-*_clean/
+*_backup_clean/
+*.bak
+*.backup.*
