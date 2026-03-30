@@ -20,3 +20,7 @@ archive/
 *_backup_clean/
 *.bak
 *.backup.*
+
+# Explicit env paths
+backend/.env
+frontend/.env.local
