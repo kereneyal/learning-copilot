@@ -1,0 +1,160 @@
+from typing import Optional, List
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+from app.models.course import Course
+from app.models.lecture import Lecture
+from app.models.document import Document
+from app.models.summary import Summary
+from app.services.vector_store import VectorStoreService
+
+
+def _snippet(text: str, length: int = 220) -> str:
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    if len(text) <= length:
+        return text
+    return text[:length] + "..."
+
+
+def _dedupe_results(results: List[dict], limit: int) -> List[dict]:
+    seen = set()
+    deduped = []
+
+    for item in results:
+        key = (
+            item.get("type"),
+            item.get("course_id"),
+            item.get("lecture_id"),
+            item.get("document_id"),
+            item.get("title"),
+            item.get("snippet"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+
+    return deduped
+
+
+def search_everywhere(db: Session, q: str, course_id: Optional[str] = None, limit: int = 10) -> List[dict]:
+    results: List[dict] = []
+    query = f"%{q}%"
+
+    # -------------------------
+    # Courses
+    # -------------------------
+    courses_query = db.query(Course)
+    if course_id:
+        courses_query = courses_query.filter(Course.id == course_id)
+
+    for c in courses_query.filter(Course.name.ilike(query)).limit(limit).all():
+        results.append({
+            "type": "course",
+            "title": c.name,
+            "snippet": "",
+            "course_id": c.id,
+            "course_name": c.name,
+        })
+
+    # -------------------------
+    # Lectures
+    # -------------------------
+    lectures_query = db.query(Lecture)
+    if course_id:
+        lectures_query = lectures_query.filter(Lecture.course_id == course_id)
+
+    for l in lectures_query.filter(
+        or_(
+            Lecture.title.ilike(query),
+            Lecture.notes.ilike(query)
+        )
+    ).limit(limit).all():
+        results.append({
+            "type": "lecture",
+            "title": l.title,
+            "snippet": _snippet(l.notes or ""),
+            "course_id": l.course_id,
+            "lecture_id": l.id,
+            "lecture_title": l.title,
+        })
+
+    # -------------------------
+    # Documents
+    # -------------------------
+    documents_query = db.query(Document)
+    if course_id:
+        documents_query = documents_query.filter(Document.course_id == course_id)
+
+    for d in documents_query.filter(
+        or_(
+            Document.file_name.ilike(query),
+            Document.topic.ilike(query),
+            Document.raw_text.ilike(query),
+        )
+    ).limit(limit).all():
+        results.append({
+            "type": "document",
+            "title": d.file_name,
+            "snippet": _snippet(d.raw_text or ""),
+            "course_id": d.course_id,
+            "lecture_id": d.lecture_id,
+            "document_id": d.id,
+            "document_name": d.file_name,
+        })
+
+    # -------------------------
+    # Summaries
+    # -------------------------
+    summary_rows = (
+        db.query(Summary, Document)
+        .join(Document, Summary.document_id == Document.id)
+        .filter(Summary.summary_text.ilike(query))
+        .limit(limit)
+        .all()
+    )
+
+    for s, d in summary_rows:
+        if course_id and d.course_id != course_id:
+            continue
+        results.append({
+            "type": "summary",
+            "title": d.file_name,
+            "snippet": _snippet(s.summary_text),
+            "course_id": d.course_id,
+            "lecture_id": d.lecture_id,
+            "document_id": d.id,
+            "document_name": d.file_name,
+        })
+
+    # -------------------------
+    # Vector search
+    # -------------------------
+    try:
+        vector = VectorStoreService()
+        vector_results = vector.search(
+            query=q,
+            course_id=course_id,
+            lecture_id=None,
+            top_k=min(5, max(1, limit))
+        )
+
+        for item in vector_results or []:
+            results.append({
+                "type": "chunk",
+                "title": item.get("document_name"),
+                "snippet": _snippet(item.get("text", "") or item.get("snippet", "")),
+                "course_id": item.get("course_id"),
+                "lecture_id": item.get("lecture_id"),
+                "document_id": item.get("document_id"),
+                "document_name": item.get("document_name"),
+                "chunk_index": item.get("chunk_index"),
+            })
+    except Exception:
+        pass
+
+    return _dedupe_results(results, limit)
