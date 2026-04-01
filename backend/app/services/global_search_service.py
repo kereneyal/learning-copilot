@@ -154,7 +154,7 @@ def search_everywhere(db: Session, q: str, course_id: Optional[str] = None, limi
                 "document_name": item.get("document_name"),
                 "chunk_index": item.get("chunk_index"),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"vector_search warning: {e}")
 
     return _dedupe_results(results, limit)

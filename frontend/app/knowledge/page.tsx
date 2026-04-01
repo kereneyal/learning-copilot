@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "next/navigation"
 import Toast from "../components/Toast"
 import LoadingSkeleton from "../components/LoadingSkeleton"
@@ -46,6 +46,9 @@ type CourseDocument = {
   source_type?: string
   uploaded_at?: string
   processing_status?: string
+  processing_progress?: number
+  error_type?: string
+  error_stage?: string
   last_error?: string
 }
 
@@ -61,6 +64,9 @@ type DocumentDetails = {
   source_type?: string
   uploaded_at?: string
   processing_status?: string
+  processing_progress?: number
+  error_type?: string
+  error_stage?: string
   last_error?: string
   has_summary?: boolean
   summary_text?: string
@@ -109,6 +115,14 @@ type SearchResultItem = {
   document_id?: string
 }
 
+type DocumentStatusResponse = {
+  status?: string
+  progress?: number
+  error?: string | null
+  error_type?: string | null
+  error_stage?: string | null
+}
+
 type SavedView = {
   name: string
   statusFilter: string
@@ -131,6 +145,10 @@ export default function KnowledgePage() {
   const [lecturers, setLecturers] = useState<Lecturer[]>([])
   const [lectures, setLectures] = useState<Lecture[]>([])
   const [documents, setDocuments] = useState<CourseDocument[]>([])
+  const [showErrorDetails, setShowErrorDetails] = useState<Record<string, boolean>>({})
+  const [activeStatusPollIds, setActiveStatusPollIds] = useState<string[]>([])
+  const statusPollIntervalRef = useRef<number | null>(null)
+  const activeStatusPollIdsRef = useRef<string[]>([])
 
   const [selectedCourseId, setSelectedCourseId] = useState("")
   const [selectedLectureId, setSelectedLectureId] = useState("")
@@ -297,9 +315,161 @@ function getSearchTypeLabel(type: string) {
   )
 
   const hasProcessingDocuments = useMemo(
-    () => documents.some((d) => d.processing_status === "processing"),
+    () =>
+      documents.some((d) => {
+        const s = (d.processing_status || "").toLowerCase()
+        return s && s !== "ready" && s !== "failed"
+      }),
     [documents]
   )
+
+  const isTerminalProcessingStatus = useCallback((status?: string) => {
+    const s = (status || "").toLowerCase()
+    return s === "ready" || s === "failed"
+  }, [])
+
+  const toHebrewStageLabel = useCallback((status?: string) => {
+    const s = (status || "").toLowerCase()
+    if (s === "extracting") return "מחלץ טקסט"
+    if (s === "chunking") return "מפצל לתוכן"
+    if (s === "embedding") return "יוצר embeddings"
+    if (s === "indexing") return "מאנדקס"
+    if (s === "processing") return "מעבד"
+    if (s === "ready") return "מוכן"
+    if (s === "failed") return "נכשל"
+    return status || "לא ידוע"
+  }, [])
+
+  const toHebrewFailureLabel = useCallback((stage?: string) => {
+    const s = (stage || "").toLowerCase()
+    if (s === "extracting") return "כשל בחילוץ טקסט"
+    if (s === "chunking") return "כשל בפיצול התוכן"
+    if (s === "embedding") return "כשל ביצירת embeddings"
+    if (s === "indexing") return "כשל באינדוקס"
+    return "כשל בעיבוד"
+  }, [])
+
+  const normalizeProgress = useCallback((progress: unknown) => {
+    const n = typeof progress === "number" ? progress : Number(progress)
+    if (!Number.isFinite(n)) return 0
+    return Math.max(0, Math.min(100, Math.round(n)))
+  }, [])
+
+  const startStatusPolling = useCallback((documentIds: string[]) => {
+    const ids = (documentIds || []).filter(Boolean)
+    if (ids.length === 0) return
+    setActiveStatusPollIds((prev) => {
+      const merged = new Set([...(prev || []), ...ids])
+      return Array.from(merged)
+    })
+  }, [])
+
+  useEffect(() => {
+    activeStatusPollIdsRef.current = activeStatusPollIds
+  }, [activeStatusPollIds])
+
+  const stopStatusPolling = useCallback(() => {
+    if (statusPollIntervalRef.current) {
+      window.clearInterval(statusPollIntervalRef.current)
+      statusPollIntervalRef.current = null
+    }
+  }, [])
+
+  const pollStatusesOnce = useCallback(async () => {
+    const ids = activeStatusPollIdsRef.current || []
+    if (ids.length === 0) return
+
+    let anyBecameReady = false
+    const nextIds: string[] = []
+
+    const results = await Promise.allSettled(
+      ids.map(async (id) => {
+        const res = await fetch(`${API_BASE}/documents/${id}/status`)
+        if (!res.ok) throw new Error(`status ${res.status}`)
+        const data = (await res.json()) as DocumentStatusResponse
+        return { id, data }
+      })
+    )
+
+    setDocuments((prev) => {
+      const byId = new Map((prev || []).map((d) => [d.id, d]))
+      for (const r of results) {
+        if (r.status !== "fulfilled") continue
+        const { id, data } = r.value
+        const current = byId.get(id)
+        if (!current) continue
+
+        const newStatus = (data?.status || current.processing_status || "processing") as string
+        const newProgress = normalizeProgress(data?.progress ?? current.processing_progress ?? 0)
+        const newError = (data?.error ?? current.last_error ?? null) as any
+        const newErrorType = (data?.error_type ?? current.error_type ?? null) as any
+        const newErrorStage = (data?.error_stage ?? current.error_stage ?? null) as any
+
+        const wasTerminal = isTerminalProcessingStatus(current.processing_status)
+        const isNowTerminal = isTerminalProcessingStatus(newStatus)
+        if (!wasTerminal && newStatus.toLowerCase() === "ready") anyBecameReady = true
+
+        byId.set(id, {
+          ...current,
+          processing_status: newStatus,
+          processing_progress: newProgress,
+          error_type: newErrorType || undefined,
+          error_stage: newErrorStage || undefined,
+          last_error: newError || undefined,
+        })
+
+        if (!isNowTerminal) nextIds.push(id)
+      }
+      return Array.from(byId.values())
+    })
+
+    // Remove terminal docs from polling set
+    setActiveStatusPollIds(Array.from(new Set(nextIds)))
+
+    // One-time refresh when at least one doc became ready
+    if (anyBecameReady) {
+      if (selectedLectureId) {
+        fetchDocumentsByLecture(selectedLectureId, false)
+      } else if (selectedCourseId) {
+        fetchDocumentsByCourse(selectedCourseId, false)
+      }
+    }
+  }, [
+    fetchDocumentsByCourse,
+    fetchDocumentsByLecture,
+    isTerminalProcessingStatus,
+    normalizeProgress,
+    selectedCourseId,
+    selectedLectureId,
+  ])
+
+  // Polling lifecycle: start interval when we have ids; stop when empty/unmount.
+  useEffect(() => {
+    stopStatusPolling()
+    if (!activeStatusPollIds || activeStatusPollIds.length === 0) return
+
+    // Immediate tick, then interval
+    pollStatusesOnce()
+    statusPollIntervalRef.current = window.setInterval(() => {
+      pollStatusesOnce()
+    }, 2000)
+
+    return () => stopStatusPolling()
+  }, [activeStatusPollIds, pollStatusesOnce, stopStatusPolling])
+
+  // Cleanup on unmount
+  useEffect(() => stopStatusPolling, [stopStatusPolling])
+
+  // Auto-start polling for any in-flight docs already in the list (e.g. refresh/navigation)
+  useEffect(() => {
+    const inFlight = (documents || [])
+      .filter((d) => d.id && !isTerminalProcessingStatus(d.processing_status))
+      .map((d) => d.id)
+    const currentlyPolling = new Set(activeStatusPollIdsRef.current || [])
+    const missing = inFlight.filter((id) => !currentlyPolling.has(id))
+    if (missing.length > 0) startStatusPolling(missing)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documents])
 
   const filteredLecturers = useMemo(() => {
     return lecturers.filter((lecturer) => {
@@ -978,7 +1148,15 @@ useEffect(() => {
 
       if (!res.ok) throw new Error()
 
+      const data = await res.json()
       setUploadProgress(100)
+
+      const uploadedIds = Array.isArray(data?.results)
+        ? data.results.map((r: any) => String(r?.id || "")).filter(Boolean)
+        : []
+      if (uploadedIds.length > 0) {
+        startStatusPolling(uploadedIds)
+      }
 
       await fetchDocumentsByLecture(uploadForm.lecture_id)
       setSelectedLectureId(uploadForm.lecture_id)
@@ -1055,7 +1233,10 @@ useEffect(() => {
   const stats = useMemo(() => {
     const total = documents.length
     const ready = documents.filter((d) => (d.processing_status || "ready") === "ready").length
-    const processing = documents.filter((d) => d.processing_status === "processing").length
+    const processing = documents.filter((d) => {
+      const s = (d.processing_status || "").toLowerCase()
+      return s && s !== "ready" && s !== "failed"
+    }).length
     const failed = documents.filter((d) => d.processing_status === "failed").length
     return { total, ready, processing, failed }
   }, [documents])
@@ -1151,7 +1332,10 @@ useEffect(() => {
     const safeDocuments = Array.isArray(documents) ? documents : []
 
     return {
-      processing: safeDocuments.filter((d) => d.processing_status === "processing").length,
+      processing: safeDocuments.filter((d) => {
+        const s = (d.processing_status || "").toLowerCase()
+        return s && s !== "ready" && s !== "failed"
+      }).length,
       failed: safeDocuments.filter((d) => d.processing_status === "failed").length,
       noSummary: safeDocuments.filter(
         (d: any) => (d.processing_status || "ready") === "ready" && !d.has_summary
@@ -1185,7 +1369,7 @@ useEffect(() => {
       const matchesQuick =
         quickFilter === "all" ||
         (quickFilter === "failed" && doc.processing_status === "failed") ||
-        (quickFilter === "processing" && doc.processing_status === "processing") ||
+        (quickFilter === "processing" && !isTerminalProcessingStatus(doc.processing_status)) ||
         (quickFilter === "no_summary" && !doc.last_error && doc.processing_status === "ready") ||
         (quickFilter === "selected_lecture" && selectedLectureId && doc.lecture_id === selectedLectureId)
 
@@ -1240,22 +1424,80 @@ useEffect(() => {
     const styles =
       normalized === "ready"
         ? "bg-emerald-100 text-emerald-700"
-        : normalized === "processing"
+        : normalized === "processing" ||
+          normalized === "extracting" ||
+          normalized === "chunking" ||
+          normalized === "embedding" ||
+          normalized === "indexing"
         ? "bg-amber-100 text-amber-700"
         : normalized === "failed"
         ? "bg-red-100 text-red-700"
         : "bg-slate-100 text-slate-700"
 
-    const label =
-      normalized === "ready"
-        ? "מוכן"
-        : normalized === "processing"
-        ? "בעיבוד"
-        : normalized === "failed"
-        ? "נכשל"
-        : normalized
+    const label = toHebrewStageLabel(normalized)
 
     return <span className={`rounded-full px-2 py-1 text-xs ${styles}`}>{label}</span>
+  }
+
+  function renderProcessingProgress(doc: CourseDocument) {
+    const status = (doc.processing_status || "processing").toLowerCase()
+    const progress =
+      status === "ready" ? 100 : normalizeProgress(doc.processing_progress ?? 0)
+    const stageLabel = toHebrewStageLabel(status)
+
+    const barColor =
+      status === "ready"
+        ? "bg-emerald-500"
+        : status === "failed"
+        ? "bg-red-500"
+        : "bg-amber-500"
+
+    const showBar = status !== "failed"
+    const failedLabel =
+      status === "failed" ? toHebrewFailureLabel(doc.error_stage || doc.processing_status) : ""
+    const technicalError = status === "failed" ? (doc.last_error || "") : ""
+    const isExpanded = !!showErrorDetails[doc.id]
+
+    return (
+      <div className="mt-2 w-[180px]">
+        <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
+          <span>{status === "failed" ? failedLabel : stageLabel}</span>
+          <span>{progress}%</span>
+        </div>
+        {showBar ? (
+          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
+            <div
+              className={`h-2 rounded-full ${barColor} transition-[width] duration-300`}
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+        ) : (
+          <div className="text-[11px] text-red-700">
+            <div className="mb-1">{failedLabel}</div>
+            {technicalError ? (
+              <>
+                <button
+                  type="button"
+                  className="text-[11px] text-slate-700 underline"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    setShowErrorDetails((prev) => ({ ...prev, [doc.id]: !prev[doc.id] }))
+                  }}
+                >
+                  {isExpanded ? "הסתר פרטים" : "הצג פרטים"}
+                </button>
+                {isExpanded && (
+                  <div className="mt-1 whitespace-pre-wrap break-words text-[11px] text-slate-600">
+                    {technicalError}
+                  </div>
+                )}
+              </>
+            ) : null}
+          </div>
+        )}
+      </div>
+    )
   }
 
   function TabButton({ tab, label }: { tab: TabKey; label: string }) {
@@ -1771,7 +2013,10 @@ useEffect(() => {
                         <td className="px-3 py-3">{doc.lecture_title || "ללא הרצאה"}</td>
                         <td className="px-3 py-3">{doc.source_type || "unknown"}</td>
                         <td className="px-3 py-3">{doc.language || "unknown"}</td>
-                        <td className="px-3 py-3">{renderStatusBadge(doc.processing_status)}</td>
+                        <td className="px-3 py-3">
+                          {renderStatusBadge(doc.processing_status)}
+                          {renderProcessingProgress(doc)}
+                        </td>
                         <td className="rounded-l-2xl px-3 py-3">
                           <div className="flex flex-wrap gap-2">
                             <button

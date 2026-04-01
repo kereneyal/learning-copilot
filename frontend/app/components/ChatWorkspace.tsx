@@ -1,6 +1,13 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+} from "react"
 import ReactMarkdown from "react-markdown"
 import CourseContextBar from "./CourseContextBar"
 import SourcePanel from "./SourcePanel"
@@ -37,12 +44,53 @@ type Source = {
   chunk_index?: number
 }
 
+type MultipleChoiceReply = {
+  correct_letter: string
+  explanation: string
+}
+
+/** Parsed MC from /questions/extract-from-image (for draft / future UI). */
+type ExtractedMcDraft = {
+  qa_mode: string
+  parsed_multiple_choice: {
+    stem?: string
+    option_script?: string
+    options?: { letter: string; text: string }[]
+    retrieval_query?: string
+  } | null
+}
+
+const QUESTION_IMAGE_ACCEPT = "image/png,image/jpeg,image/jpg,image/webp"
+const QUESTION_IMAGE_EXTENSIONS = /\.(png|jpe?g|webp)$/i
+
+function isAllowedPasteImageMime(mime: string): boolean {
+  const t = mime.toLowerCase().split(";")[0].trim()
+  return (
+    t === "image/png" ||
+    t === "image/jpeg" ||
+    t === "image/jpg" ||
+    t === "image/pjpeg" ||
+    t === "image/webp"
+  )
+}
+
+function extensionForImageMime(mime: string): string {
+  const t = mime.toLowerCase().split(";")[0].trim()
+  if (t === "image/png") return ".png"
+  if (t === "image/webp") return ".webp"
+  return ".jpg"
+}
+
 type Message = {
   role: "user" | "assistant"
   content: string
   sources?: Source[]
+  /** Search-intent only: inline list under the answer. QA uses sources panel only. */
   search_results?: Source[]
+  showInlineResults?: boolean
   mode?: string
+  qa_mode?: string
+  multiple_choice?: MultipleChoiceReply | null
 }
 
 type AssistantTab = "chat" | "exam"
@@ -70,6 +118,44 @@ type ExamSimulationResult = {
   weak_topics: string[]
 }
 
+function MultipleChoiceAnswerBlock({
+  mc,
+  fallbackContent,
+}: {
+  mc: MultipleChoiceReply
+  fallbackContent: string
+}) {
+  const isUnknown = mc.correct_letter === "UNKNOWN"
+
+  const badgeClassName = isUnknown
+    ? "rounded-xl border border-slate-200 bg-slate-50 px-4 py-4 text-center"
+    : "rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-4 text-center"
+  const headingClassName = isUnknown
+    ? "text-xs font-medium uppercase tracking-wide text-slate-500"
+    : "text-xs font-medium uppercase tracking-wide text-emerald-700"
+  const letterClassName = isUnknown
+    ? "mt-1 text-3xl font-bold text-slate-800 tabular-nums"
+    : "mt-1 text-3xl font-bold text-emerald-900 tabular-nums"
+  const helperClassName = "mt-2 text-xs font-medium text-emerald-800/90"
+
+  return (
+    <div className="space-y-4">
+      <div className={badgeClassName}>
+        <div className={headingClassName}>תשובה נבחרת</div>
+        <div className={letterClassName} dir="auto">
+          {isUnknown ? "לא נכרע" : mc.correct_letter}
+        </div>
+        {!isUnknown && (
+          <p className={helperClassName}>תשובה נכונה לפי החומר</p>
+        )}
+      </div>
+      <div className="prose prose-sm max-w-none text-slate-900">
+        <ReactMarkdown>{mc.explanation || fallbackContent}</ReactMarkdown>
+      </div>
+    </div>
+  )
+}
+
 export default function ChatWorkspace() {
   const [assistantTab, setAssistantTab] = useState<AssistantTab>("chat")
 
@@ -82,6 +168,11 @@ export default function ChatWorkspace() {
   const [input, setInput] = useState("")
   const [sending, setSending] = useState(false)
   const [error, setError] = useState("")
+  const [imageExtractError, setImageExtractError] = useState("")
+  const [imageExtractSuccessHint, setImageExtractSuccessHint] = useState("")
+  const [imageExtracting, setImageExtracting] = useState(false)
+  const [draftExtractedMc, setDraftExtractedMc] = useState<ExtractedMcDraft | null>(null)
+  const questionImageInputRef = useRef<HTMLInputElement | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
 
   const [examLoading, setExamLoading] = useState(false)
@@ -196,8 +287,11 @@ export default function ChatWorkspace() {
     const userText = input
     setMessages((prev) => [...prev, { role: "user", content: userText }])
     setInput("")
+    setDraftExtractedMc(null)
     setSending(true)
     setError("")
+    setImageExtractError("")
+    setImageExtractSuccessHint("")
 
     try {
       const body: any = {
@@ -205,7 +299,9 @@ export default function ChatWorkspace() {
         mode: chatMode,
       }
 
-      if (chatMode === "course" || chatMode === "lecture") {
+      // Course context from the UI: always send when a course is selected, except explicit global mode.
+      // Lets the backend use lexical + hybrid retrieval in "auto" without relying on question-only resolution.
+      if (selectedCourseId && chatMode !== "global") {
         body.course_id = selectedCourseId
       }
 
@@ -234,13 +330,125 @@ export default function ChatWorkspace() {
           content: data.answer,
           sources: data.sources || [],
           search_results: data.search_results || [],
+          showInlineResults: data.show_inline_results === true,
           mode: data.mode,
+          qa_mode: data.qa_mode,
+          multiple_choice: data.multiple_choice ?? null,
         },
       ])
     } catch {
       setError("שגיאה בקבלת תשובת הסוכן")
     } finally {
       setSending(false)
+    }
+  }
+
+  function openQuestionImagePicker() {
+    setImageExtractError("")
+    setImageExtractSuccessHint("")
+    questionImageInputRef.current?.click()
+  }
+
+  async function extractQuestionImageFromFile(
+    file: File,
+    source: "file" | "paste"
+  ) {
+    setImageExtractError("")
+    setImageExtractSuccessHint("")
+    setImageExtracting(true)
+    try {
+      const fd = new FormData()
+      fd.append("file", file)
+
+      const res = await fetch(`${API_BASE}/questions/extract-from-image`, {
+        method: "POST",
+        body: fd,
+      })
+
+      const data = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        if (source === "paste") {
+          setImageExtractError("לא הצלחנו לזהות טקסט מהתמונה")
+        } else {
+          let detailMsg =
+            "לא ניתן לחלץ טקסט מהתמונה. נסה תמונה אחרת או בדוק את חיבור השרת."
+          const d = data?.detail
+          if (typeof d === "string") detailMsg = d
+          else if (Array.isArray(d))
+            detailMsg = d.map((x: unknown) => String(x)).join(" ")
+          setImageExtractError(detailMsg)
+        }
+        return
+      }
+
+      const normalized =
+        typeof data.normalized_text === "string" ? data.normalized_text : ""
+      if (!normalized.trim()) {
+        setImageExtractError(
+          source === "paste"
+            ? "לא הצלחנו לזהות טקסט מהתמונה"
+            : "לא זוהה טקסט בתמונה. נסה צילום חד יותר."
+        )
+        return
+      }
+
+      setInput(normalized)
+      setDraftExtractedMc({
+        qa_mode: data.qa_mode === "multiple_choice" ? "multiple_choice" : "open",
+        parsed_multiple_choice:
+          data.parsed_multiple_choice && typeof data.parsed_multiple_choice === "object"
+            ? data.parsed_multiple_choice
+            : null,
+      })
+      setImageExtractSuccessHint("השאלה זוהתה מהתמונה")
+    } catch {
+      setImageExtractError(
+        source === "paste"
+          ? "לא הצלחנו לזהות טקסט מהתמונה"
+          : "שגיאת רשת בזמן העלאת התמונה. נסה שוב."
+      )
+    } finally {
+      setImageExtracting(false)
+    }
+  }
+
+  async function onQuestionImageSelected(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ""
+    if (!file) return
+
+    if (!QUESTION_IMAGE_EXTENSIONS.test(file.name)) {
+      setImageExtractError("נא להעלות תמונה מסוג PNG, JPG או WebP בלבד.")
+      return
+    }
+
+    await extractQuestionImageFromFile(file, "file")
+  }
+
+  function onChatInputPaste(e: ClipboardEvent<HTMLInputElement>) {
+    if (imageExtracting || sending) return
+
+    const items = e.clipboardData?.items
+    if (!items?.length) return
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.kind !== "file") continue
+      const mime = item.type || ""
+      if (!mime.startsWith("image/")) continue
+      if (!isAllowedPasteImageMime(mime)) continue
+
+      const blob = item.getAsFile()
+      if (!blob || blob.size === 0) continue
+
+      e.preventDefault()
+      const name = blob.name?.trim()
+        ? blob.name
+        : `pasted-image${extensionForImageMime(mime)}`
+      const file = new File([blob], name, { type: blob.type || mime })
+      void extractQuestionImageFromFile(file, "paste")
+      return
     }
   }
 
@@ -460,11 +668,30 @@ export default function ChatWorkspace() {
                             {m.role === "user" ? "אתה" : `הסוכן${m.mode ? ` • ${m.mode}` : ""}`}
                           </div>
 
-                          <div className={`prose prose-sm max-w-none ${m.role === "user" ? "prose-invert" : ""}`}>
-                            <ReactMarkdown>{m.content}</ReactMarkdown>
+                          <div
+                            className={
+                              m.role === "user"
+                                ? "prose prose-sm max-w-none prose-invert"
+                                : m.qa_mode === "multiple_choice" && m.multiple_choice
+                                  ? "not-prose max-w-none"
+                                  : "prose prose-sm max-w-none text-slate-900"
+                            }
+                          >
+                            {m.role === "assistant" &&
+                            m.qa_mode === "multiple_choice" &&
+                            m.multiple_choice ? (
+                              <MultipleChoiceAnswerBlock
+                                mc={m.multiple_choice}
+                                fallbackContent={m.content}
+                              />
+                            ) : (
+                              <ReactMarkdown>{m.content}</ReactMarkdown>
+                            )}
                           </div>
 
-                          {m.role === "assistant" && !!m.search_results?.length && (
+                          {m.role === "assistant" &&
+                            m.showInlineResults === true &&
+                            !!m.search_results?.length && (
                             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3">
                               <div className="mb-3 text-sm font-semibold text-slate-700">
                                 נמצאו תוצאות רלוונטיות
@@ -504,16 +731,66 @@ export default function ChatWorkspace() {
                 )}
               </div>
 
-              <div className="mt-4 flex gap-2">
+              {imageExtractError && (
+                <div
+                  className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                  role="alert"
+                >
+                  {imageExtractError}
+                </div>
+              )}
+
+              {imageExtractSuccessHint && !imageExtractError && (
+                <div className="mt-2 text-sm text-emerald-700" role="status">
+                  {imageExtractSuccessHint}
+                </div>
+              )}
+
+              {draftExtractedMc?.qa_mode === "multiple_choice" && (
+                <div className="mt-2 flex items-center gap-2">
+                  <span className="inline-flex items-center rounded-full bg-violet-100 px-2.5 py-0.5 text-xs font-medium text-violet-800">
+                    זוהתה שאלה אמריקאית
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDraftExtractedMc(null)
+                      setImageExtractSuccessHint("")
+                    }}
+                    className="text-xs text-slate-500 underline hover:text-slate-700"
+                  >
+                    הסר סימון
+                  </button>
+                </div>
+              )}
+
+              <div className="mt-2 flex gap-2">
+                <input
+                  ref={questionImageInputRef}
+                  type="file"
+                  accept={QUESTION_IMAGE_ACCEPT}
+                  className="hidden"
+                  onChange={onQuestionImageSelected}
+                />
                 <input
                   className="flex-1 rounded-xl border px-4 py-3"
                   placeholder="שאל שאלה על הידע שבמערכת..."
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
+                  onPaste={onChatInputPaste}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") sendMessage()
                   }}
                 />
+                <button
+                  type="button"
+                  title="העלאת תמונת שאלה (חילוץ טקסט)"
+                  onClick={openQuestionImagePicker}
+                  disabled={imageExtracting || sending}
+                  className="shrink-0 rounded-xl border border-slate-200 bg-white px-3 py-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {imageExtracting ? "מחלץ…" : "תמונה"}
+                </button>
                 <button
                   onClick={sendMessage}
                   disabled={sending}

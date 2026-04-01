@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey, Integer
 from sqlalchemy.sql import func
 
 from app.db.database import Base
@@ -23,6 +23,9 @@ class Document(Base):
 
     raw_text = Column(Text, nullable=True)
     processing_status = Column(String, nullable=True, default="ready")
+    processing_progress = Column(Integer, nullable=True, default=0)
+    error_type = Column(String, nullable=True)
+    error_stage = Column(String, nullable=True)
     last_error = Column(Text, nullable=True)
 
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())

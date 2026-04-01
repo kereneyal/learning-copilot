@@ -24,3 +24,7 @@ archive/
 # Explicit env paths
 backend/.env
 frontend/.env.local
+
+# Local DB
+*.db
+backend/*.db

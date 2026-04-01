@@ -5,7 +5,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db.database import Base, engine
+from app.db.database import Base, engine, ensure_sqlite_schema
 
 from app.routes.courses import router as courses_router
 from app.routes.lecturers import router as lecturers_router
@@ -17,6 +17,7 @@ from app.routes.course_summaries import router as course_summaries_router
 from app.routes.knowledge_maps import router as knowledge_maps_router
 from app.routes.copilot import router as copilot_router
 from app.routes.search import router as search_router
+from app.routes.question_image import router as question_image_router
 
 from app.models.course import Course
 from app.models.lecturer import Lecturer
@@ -30,6 +31,7 @@ from app.models.exam_simulation import ExamSimulation
 from app.models.exam_simulation_question import ExamSimulationQuestion
 
 Base.metadata.create_all(bind=engine)
+ensure_sqlite_schema()
 
 app = FastAPI(title="Learning Copilot")
 
@@ -50,6 +52,7 @@ app.include_router(qa_router)
 app.include_router(course_summaries_router)
 app.include_router(knowledge_maps_router)
 app.include_router(copilot_router)
+app.include_router(question_image_router)
 
 
 @app.get("/")

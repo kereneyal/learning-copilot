@@ -1,12 +1,17 @@
 import os
 import shutil
+import threading
+import json
+import logging
+import time
+import concurrent.futures
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.models.document import Document
 from app.models.summary import Summary
 from app.models.course_summary import CourseSummary
@@ -24,6 +29,8 @@ from app.services.media_extraction_service import (
     is_media_file,
     get_media_type,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
@@ -43,9 +50,27 @@ def _set_processing_status(document: Document, status: str):
         setattr(document, "processing_status", status)
 
 
+def _set_processing_progress(document: Document, progress: int):
+    if hasattr(document, "processing_progress"):
+        try:
+            current = getattr(document, "processing_progress", 0) or 0
+            next_val = max(0, min(100, int(progress)))
+            # progress must never decrease
+            setattr(document, "processing_progress", max(int(current), next_val))
+        except Exception:
+            setattr(document, "processing_progress", 0)
+
+
 def _set_last_error(document: Document, message: Optional[str]):
     if hasattr(document, "last_error"):
         setattr(document, "last_error", message)
+
+
+def _set_error_fields(document: Document, error_type: Optional[str], error_stage: Optional[str]):
+    if hasattr(document, "error_type"):
+        setattr(document, "error_type", error_type)
+    if hasattr(document, "error_stage"):
+        setattr(document, "error_stage", error_stage)
 
 
 def _document_to_dict(doc: Document, lecture_title: Optional[str] = None):
@@ -74,11 +99,69 @@ def _document_to_dict(doc: Document, lecture_title: Optional[str] = None):
         "source_type": doc.source_type,
         "uploaded_at": getattr(doc, "uploaded_at", None),
         "processing_status": getattr(doc, "processing_status", "ready"),
+        "processing_progress": getattr(doc, "processing_progress", 0),
+        "error_type": getattr(doc, "error_type", None),
+        "error_stage": getattr(doc, "error_stage", None),
         "last_error": getattr(doc, "last_error", None),
         "has_summary": has_summary,
         "raw_text_length": len(raw_text),
         "summary_preview": summary_preview,
     }
+
+
+def _update_processing_state(db: Session, doc: Document, status: str, progress: int):
+    _set_processing_status(doc, status)
+    _set_processing_progress(doc, progress)
+    db.commit()
+    db.refresh(doc)
+
+
+class StageTimeoutError(Exception):
+    def __init__(self, stage: str, timeout_s: int):
+        super().__init__(f"Stage timeout: {stage} exceeded {timeout_s}s")
+        self.stage = stage
+        self.timeout_s = timeout_s
+
+
+class ProcessingStageError(Exception):
+    def __init__(self, stage: str, error_type: str, message: str, retriable: bool = False):
+        super().__init__(message)
+        self.stage = stage
+        self.error_type = error_type
+        self.message = message
+        self.retriable = retriable
+
+
+def _run_with_timeout(stage: str, fn, timeout_s: int = 60):
+    start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            raise StageTimeoutError(stage=stage, timeout_s=timeout_s)
+        finally:
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.info("stage.timing stage=%s elapsed_ms=%s", stage, elapsed_ms)
+
+
+def _derive_error_fields(exc: Exception, fallback_stage: str):
+    stage = fallback_stage
+    if isinstance(exc, ProcessingStageError):
+        stage = exc.stage or fallback_stage
+    elif isinstance(exc, StageTimeoutError):
+        stage = exc.stage or fallback_stage
+
+    stage_norm = (stage or fallback_stage or "").lower()
+    if stage_norm in {"extracting"}:
+        return "extraction_error", "extracting"
+    if stage_norm in {"chunking"}:
+        return "chunking_error", "chunking"
+    if stage_norm in {"embedding"}:
+        return "embedding_error", "embedding"
+    if stage_norm in {"indexing"}:
+        return "indexing_error", "indexing"
+    return "processing_error", stage_norm or "processing"
 
 
 def _refresh_course_aggregates(db: Session, course_id: str, language: str = "en"):
@@ -132,34 +215,69 @@ def _process_existing_document(db: Session, doc: Document):
 
     file_extension = (doc.file_type or doc.file_name.split(".")[-1].lower()) if doc.file_name else "txt"
 
-    _set_processing_status(doc, "processing")
     _set_last_error(doc, None)
-    db.commit()
-    db.refresh(doc)
+    _set_error_fields(doc, None, None)
+    _update_processing_state(db, doc, "extracting", 20)
+    logger.info("processing.stage_start doc_id=%s stage=extracting", doc.id)
 
     ingestion_agent = IngestionAgent()
     media_service = MediaExtractionService()
 
-    if doc.file_name and is_media_file(doc.file_name):
-        with open(doc.file_path, "rb") as f:
-            file_bytes = f.read()
+    def _extract():
+        if doc.file_name and is_media_file(doc.file_name):
+            with open(doc.file_path, "rb") as f:
+                file_bytes = f.read()
 
-        media_result = media_service.transcribe_file(file_bytes, doc.file_name)
+            media_result = media_service.transcribe_file(file_bytes, doc.file_name)
 
-        if not media_result.get("success"):
-            raise Exception(media_result.get("error") or "Media transcription failed")
+            if not media_result.get("success"):
+                raise ProcessingStageError(
+                    stage="extracting",
+                    error_type="media_transcription_failed",
+                    message=media_result.get("error") or "Media transcription failed",
+                    retriable=True,
+                )
 
-        extracted_text = media_result.get("text", "") or ""
-        detected_language = ingestion_agent.detect_language(extracted_text) if extracted_text else "en"
+            extracted_text_local = media_result.get("text", "") or ""
+            detected_language_local = ingestion_agent.detect_language(extracted_text_local) if extracted_text_local else "en"
 
-        if not getattr(doc, "source_type", None):
-            doc.source_type = get_media_type(doc.file_name)
-    else:
-        extracted_text = ingestion_agent.extract_text(doc.file_path, file_extension)
-        detected_language = ingestion_agent.detect_language(extracted_text)
+            if not getattr(doc, "source_type", None):
+                doc.source_type = get_media_type(doc.file_name)
 
-    chunking_agent = ChunkingAgent(max_chunk_size=1200, overlap_size=200)
-    chunks = chunking_agent.chunk_text(extracted_text)
+            return extracted_text_local, detected_language_local
+
+        extracted_text_local = ingestion_agent.extract_text(doc.file_path, file_extension)
+        detected_language_local = ingestion_agent.detect_language(extracted_text_local)
+        return extracted_text_local, detected_language_local
+
+    extracted_text, detected_language = _run_with_timeout("extracting", _extract, timeout_s=60)
+    logger.info("processing.stage_end doc_id=%s stage=extracting text_len=%s", doc.id, len(extracted_text or ""))
+
+    if not (extracted_text or "").strip():
+        raise ProcessingStageError(
+            stage="extracting",
+            error_type="no_extractable_text",
+            message=f"No extractable text (file_type={file_extension}). This file may be scanned/empty/unsupported.",
+            retriable=False,
+        )
+
+    _update_processing_state(db, doc, "chunking", 40)
+    logger.info("processing.stage_start doc_id=%s stage=chunking", doc.id)
+
+    def _chunk():
+        chunking_agent = ChunkingAgent(max_chunk_size=1200, overlap_size=200)
+        return chunking_agent.chunk_text(extracted_text)
+
+    chunks = _run_with_timeout("chunking", _chunk, timeout_s=60)
+    logger.info("processing.stage_end doc_id=%s stage=chunking chunks=%s", doc.id, len(chunks or []))
+
+    if not chunks:
+        raise ProcessingStageError(
+            stage="chunking",
+            error_type="no_chunks",
+            message="Chunking produced 0 chunks; cannot index document for search.",
+            retriable=False,
+        )
 
     doc.language = detected_language
     doc.raw_text = extracted_text
@@ -167,26 +285,46 @@ def _process_existing_document(db: Session, doc: Document):
     db.commit()
     db.refresh(doc)
 
+    _update_processing_state(db, doc, "embedding", 70)
+    logger.info("processing.stage_start doc_id=%s stage=embedding", doc.id)
+
     vector_store = VectorStoreService()
-    try:
-      vector_store.delete_by_document_id(doc.id)
-    except Exception:
-      pass
 
-    vector_store.add_chunks(
-        document_id=doc.id,
-        course_id=doc.course_id,
-        lecture_id=getattr(doc, "lecture_id", None),
-        chunks=chunks,
-    )
+    def _embed_and_write():
+        try:
+            vector_store.delete_by_document_id(doc.id)
+        except Exception:
+            pass
+        return vector_store.add_chunks(
+            document_id=doc.id,
+            course_id=doc.course_id,
+            lecture_id=getattr(doc, "lecture_id", None),
+            chunks=chunks,
+            embed_attempts=3,
+            write_attempts=3,
+            stage_timeout_s=60,
+        )
 
-    _set_processing_status(doc, "ready")
-    _set_last_error(doc, None)
-    db.commit()
-    db.refresh(doc)
+    added = _run_with_timeout("embedding", _embed_and_write, timeout_s=60)
+    logger.info("processing.stage_end doc_id=%s stage=embedding indexed_chunks=%s", doc.id, added)
 
-    db.query(Summary).filter(Summary.document_id == doc.id).delete(synchronize_session=False)
-    db.commit()
+    if added <= 0:
+        raise ProcessingStageError(
+            stage="embedding",
+            error_type="vector_store_empty_write",
+            message="Vector store write produced 0 indexed chunks.",
+            retriable=True,
+        )
+
+    _update_processing_state(db, doc, "indexing", 90)
+    logger.info("processing.stage_start doc_id=%s stage=indexing", doc.id)
+
+    def _indexing():
+        db.query(Summary).filter(Summary.document_id == doc.id).delete(synchronize_session=False)
+        db.commit()
+
+    _run_with_timeout("indexing", _indexing, timeout_s=60)
+    logger.info("processing.stage_end doc_id=%s stage=indexing", doc.id)
 
     summary_agent = SummaryAgent()
     summary_text = summary_agent.summarize(
@@ -202,6 +340,8 @@ def _process_existing_document(db: Session, doc: Document):
     db.add(new_summary)
     db.commit()
 
+    _update_processing_state(db, doc, "ready", 100)
+
     aggregate_warning = None
     try:
         _refresh_course_aggregates(
@@ -212,9 +352,7 @@ def _process_existing_document(db: Session, doc: Document):
     except Exception as e:
         aggregate_warning = str(e)
         _set_last_error(doc, aggregate_warning)
-        _set_processing_status(doc, "ready")
-        db.commit()
-        db.refresh(doc)
+        _update_processing_state(db, doc, "ready", 100)
 
     return {
         "id": doc.id,
@@ -241,13 +379,12 @@ def _process_single_upload(
 
     safe_filename = os.path.basename(file.filename)
     file_extension = safe_filename.split(".")[-1].lower() if "." in safe_filename else "txt"
-    saved_file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     new_document = Document(
         course_id=course_id,
         lecture_id=lecture_id,
         file_name=safe_filename,
-        file_path=saved_file_path,
+        file_path="",
         file_type=file_extension,
         language=None,
         source_type=source_type,
@@ -256,9 +393,18 @@ def _process_single_upload(
     )
 
     _set_processing_status(new_document, "processing")
+    _set_processing_progress(new_document, 0)
     _set_last_error(new_document, None)
 
     db.add(new_document)
+    db.commit()
+    db.refresh(new_document)
+
+    doc_dir = os.path.join(UPLOAD_DIR, new_document.id)
+    os.makedirs(doc_dir, exist_ok=True)
+    saved_file_path = os.path.join(doc_dir, safe_filename)
+
+    new_document.file_path = saved_file_path
     db.commit()
     db.refresh(new_document)
 
@@ -266,14 +412,46 @@ def _process_single_upload(
         with open(saved_file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        result = _process_existing_document(db, new_document)
+        def _run_processing_in_thread(document_id: str):
+            thread_db = SessionLocal()
+            try:
+                doc_in_thread = thread_db.query(Document).filter(Document.id == document_id).first()
+                if not doc_in_thread:
+                    return
+                try:
+                    _process_existing_document(thread_db, doc_in_thread)
+                except Exception as e:
+                    _set_processing_status(doc_in_thread, "failed")
+                    error_type, error_stage = _derive_error_fields(
+                        e,
+                        fallback_stage=getattr(doc_in_thread, "processing_status", "processing") or "processing",
+                    )
+                    _set_error_fields(doc_in_thread, error_type, error_stage)
+                    # Keep last_error as raw technical message for optional display.
+                    _set_last_error(doc_in_thread, str(e))
+                    thread_db.commit()
+            finally:
+                thread_db.close()
+
+        t = threading.Thread(target=_run_processing_in_thread, args=(new_document.id,), daemon=True)
+        t.start()
+
+        # Return immediately; preserve existing response keys (placeholders)
         return {
-            **result,
+            "id": new_document.id,
             "course_id": new_document.course_id,
             "lecture_id": new_document.lecture_id,
+            "file_name": new_document.file_name,
+            "file_type": new_document.file_type,
+            "language": getattr(new_document, "language", None),
             "topic": new_document.topic,
             "source_type": new_document.source_type,
-            "file_type": new_document.file_type,
+            "processing_status": getattr(new_document, "processing_status", "processing"),
+            "processing_progress": getattr(new_document, "processing_progress", 0),
+            "last_error": getattr(new_document, "last_error", None),
+            "chunks_count": 0,
+            "raw_text_preview": "",
+            "summary_created": False,
         }
 
     except Exception as e:
@@ -345,6 +523,23 @@ def upload_multiple_documents(
     return {
         "uploaded_count": len(results),
         "results": results
+    }
+
+
+@router.get("/{document_id}/status")
+def get_document_status(document_id: str, db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return {
+        "status": getattr(doc, "processing_status", "ready"),
+        "progress": getattr(doc, "processing_progress", 0) or 0,
+        # Keep existing contract field name and value: technical error string (frontend hides by default)
+        "error": getattr(doc, "last_error", None),
+        # Add structured fields (non-breaking additions)
+        "error_type": getattr(doc, "error_type", None),
+        "error_stage": getattr(doc, "error_stage", None),
     }
 
 
@@ -430,6 +625,7 @@ def get_document_details(document_id: str, db: Session = Depends(get_db)):
         "source_type": doc.source_type,
         "uploaded_at": getattr(doc, "uploaded_at", None),
         "processing_status": getattr(doc, "processing_status", "ready"),
+        "processing_progress": getattr(doc, "processing_progress", 0),
         "last_error": getattr(doc, "last_error", None),
         "has_summary": bool(summary_text.strip()),
         "summary_text": summary_text,

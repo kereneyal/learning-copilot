@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from typing import Optional
@@ -7,9 +9,11 @@ from app.db.database import get_db
 from app.agents.qa_agent import QAAgent
 from app.services.course_resolver import resolve_course_from_question
 from app.services.global_search_service import search_everywhere
+from app.services.multiple_choice_parser import parse_multiple_choice
 
 router = APIRouter()
 agent = QAAgent()
+logger = logging.getLogger(__name__)
 
 
 def _normalize_search_query(question: str) -> str:
@@ -165,68 +169,91 @@ def ask(req: QuestionRequest, db: Session = Depends(get_db)):
     resolved_course_id = req.course_id
     resolution_confidence = 0.0
 
-    if resolved_mode == "auto":
-        detected_course_id, confidence = resolve_course_from_question(db, req.question)
-        if detected_course_id:
+    if resolved_mode == "global":
+        resolved_course_id = None
+    elif resolved_mode == "auto":
+        if req.course_id:
             resolved_mode = "course"
-            resolved_course_id = detected_course_id
-            resolution_confidence = confidence
+            resolved_course_id = req.course_id
+            resolution_confidence = 1.0
         else:
-            resolved_mode = "global"
+            detected_course_id, confidence = resolve_course_from_question(db, req.question)
+            if detected_course_id:
+                resolved_mode = "course"
+                resolved_course_id = detected_course_id
+                resolution_confidence = confidence
+            else:
+                resolved_mode = "global"
+                resolved_course_id = None
 
     elif resolved_mode == "lecture":
         if not req.lecture_id:
             resolved_mode = "global"
+            resolved_course_id = None
 
     elif resolved_mode == "course":
         if not req.course_id:
             resolved_mode = "global"
+            resolved_course_id = None
+
+    qa_course_id = resolved_course_id if resolved_mode in {"course", "lecture"} else None
+    qa_lecture_id = req.lecture_id if resolved_mode == "lecture" else None
+    logger.info(
+        "copilot_ask: resolved_mode=%s resolved_course_id=%s qa_lecture_id=%s "
+        "lexical_will_enable=%s (UI course hint=%s)",
+        resolved_mode,
+        qa_course_id,
+        qa_lecture_id,
+        bool(qa_course_id),
+        bool(req.course_id),
+    )
 
     search_query = _normalize_search_query(req.question)
 
-    search_results = search_everywhere(
-        db=db,
-        q=search_query or req.question,
-        course_id=resolved_course_id if resolved_mode in {"course", "lecture"} else None,
-        limit=6,
-    )
+    # אם זו שאלת חיפוש – משתמשים ב-search_everywhere (כולל וקטורי) לתשובה ולרשימת תוצאות
+    if _is_search_intent(req.question):
+        search_results = search_everywhere(
+            db=db,
+            q=search_query or req.question,
+            course_id=resolved_course_id if resolved_mode in {"course", "lecture"} else None,
+            limit=6,
+        )
+        if search_results:
+            merged_sources = _merge_sources([], search_results, limit=8)
 
-    # אם זו שאלת חיפוש ויש תוצאות – עונים ישירות מה-search
-    if _is_search_intent(req.question) and search_results:
-        merged_sources = _merge_sources([], search_results, limit=8)
+            return {
+                "answer": _build_search_answer(req.question, search_results),
+                "sources": merged_sources,
+                "search_results": search_results,
+                "show_inline_results": True,
+                "mode": resolved_mode,
+                "resolved_course_id": resolved_course_id,
+                "resolution_confidence": resolution_confidence,
+            }
 
-        return {
-            "answer": _build_search_answer(req.question, search_results),
-            "sources": merged_sources,
-            "search_results": search_results,
-            "mode": resolved_mode,
-            "resolved_course_id": resolved_course_id,
-            "resolution_confidence": resolution_confidence
-        }
+    # שאלות QA: אותם צ'אנקים שהגיעו להקשר הסופי (היברידי + שער דומיין) — בלי מיזוג לתוצאות וקטוריות רחבות
+    mc_parsed = parse_multiple_choice(req.question)
+    qa_mode = "multiple_choice" if mc_parsed else "open"
 
-    # אחרת משתמשים ב-QAAgent
     result = agent.answer(
         question=req.question,
         db=db,
-        course_id=resolved_course_id if resolved_mode in {"course", "lecture"} else None,
-        lecture_id=req.lecture_id if resolved_mode == "lecture" else None
+        course_id=qa_course_id,
+        lecture_id=qa_lecture_id,
+        qa_mode=qa_mode,
+        mc_parsed=mc_parsed,
     )
 
-    merged_sources = _merge_sources(
-        result.get("sources", []),
-        search_results,
-        limit=8,
-    )
-
-    answer_text = result["answer"]
-    if _is_search_intent(req.question) and search_results:
-        answer_text = _build_search_answer(req.question, search_results)
+    qa_sources = result.get("sources", []) or []
 
     return {
-        "answer": answer_text,
-        "sources": merged_sources,
-        "search_results": search_results,
+        "answer": result["answer"],
+        "sources": qa_sources,
+        "search_results": [],
+        "show_inline_results": False,
         "mode": resolved_mode,
         "resolved_course_id": resolved_course_id,
-        "resolution_confidence": resolution_confidence
+        "resolution_confidence": resolution_confidence,
+        "qa_mode": qa_mode,
+        "multiple_choice": result.get("multiple_choice"),
     }
