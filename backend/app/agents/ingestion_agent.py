@@ -1,12 +1,20 @@
 import os
+from typing import Any, Dict, Optional
+
 import fitz  # PyMuPDF
 from docx import Document as DocxDocument
 from pptx import Presentation
 
 
 class IngestionAgent:
+    """last_pdf_meta is set after extract_text when file_type is pdf (for logging)."""
+
+    def __init__(self):
+        self.last_pdf_meta: Optional[Dict[str, Any]] = None
+
     def extract_text(self, file_path: str, file_type: str) -> str:
         file_type = file_type.lower()
+        self.last_pdf_meta = None
 
         if file_type == "pdf":
             return self._extract_from_pdf(file_path)
@@ -28,11 +36,15 @@ class IngestionAgent:
         return "en"
 
     def _extract_from_pdf(self, file_path: str) -> str:
-        text = ""
-        doc = fitz.open(file_path)
-        for page in doc:
-            text += page.get_text()
-        return text.strip()
+        from app.services.pdf_ocr_service import extract_pdf_for_ingestion
+
+        result = extract_pdf_for_ingestion(file_path)
+        self.last_pdf_meta = {
+            "provider": result.provider,
+            "pages_processed": result.pages_processed,
+            "ocr_used": result.ocr_used,
+        }
+        return result.text or ""
 
     def _extract_from_docx(self, file_path: str) -> str:
         doc = DocxDocument(file_path)

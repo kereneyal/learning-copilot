@@ -250,14 +250,37 @@ def _process_existing_document(db: Session, doc: Document):
         detected_language_local = ingestion_agent.detect_language(extracted_text_local)
         return extracted_text_local, detected_language_local
 
-    extracted_text, detected_language = _run_with_timeout("extracting", _extract, timeout_s=60)
+    extract_timeout_s = 180 if (file_extension or "").lower() == "pdf" else 60
+    extracted_text, detected_language = _run_with_timeout(
+        "extracting", _extract, timeout_s=extract_timeout_s
+    )
     logger.info("processing.stage_end doc_id=%s stage=extracting text_len=%s", doc.id, len(extracted_text or ""))
+    pdf_meta = getattr(ingestion_agent, "last_pdf_meta", None)
+    if (file_extension or "").lower() == "pdf" and pdf_meta:
+        logger.info(
+            "processing.pdf_extraction doc_id=%s final_provider=%s pages_processed=%s ocr_used=%s",
+            doc.id,
+            pdf_meta.get("provider"),
+            pdf_meta.get("pages_processed"),
+            pdf_meta.get("ocr_used"),
+        )
 
     if not (extracted_text or "").strip():
+        if (file_extension or "").lower() == "pdf":
+            fail_msg = (
+                "No extractable text (file_type=pdf). Text layer missing or too weak; "
+                "OCR was unavailable or did not yield usable text; "
+                "vision fallback did not yield usable text."
+            )
+        else:
+            fail_msg = (
+                f"No extractable text (file_type={file_extension}). "
+                "This file may be scanned/empty/unsupported."
+            )
         raise ProcessingStageError(
             stage="extracting",
             error_type="no_extractable_text",
-            message=f"No extractable text (file_type={file_extension}). This file may be scanned/empty/unsupported.",
+            message=fail_msg,
             retriable=False,
         )
 
