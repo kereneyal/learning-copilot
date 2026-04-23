@@ -11,15 +11,15 @@ class VectorStoreService:
 
     def _embed(self, text):
         response = requests.post(
-            f"{self.ollama_base_url}/api/embeddings",
+            f"{self.ollama_base_url}/api/embed",
             json={
                 "model": self.embedding_model,
-                "prompt": text
+                "input": text
             },
             timeout=120
         )
         response.raise_for_status()
-        return response.json()["embedding"]
+        return response.json()["embeddings"][0]
 
     def add_chunks(self, document_id, course_id, lecture_id, chunks):
         if not chunks:

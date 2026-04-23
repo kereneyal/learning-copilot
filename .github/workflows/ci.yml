@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  # ── Backend tests ────────────────────────────────────────────────────────────
+  backend-test:
+    name: Backend — pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install system dependencies
+        # Tesseract is required by pdf_ocr_service; libgl1 by PyMuPDF.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr \
+            libgl1-mesa-glx \
+            libglib2.0-0
+
+      - name: Install Python dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          # Tests create in-memory SQLite DBs; these vars prevent the app
+          # module from attempting real Ollama / ChromaDB connections at import.
+          DATABASE_URL: "sqlite:///:memory:"
+          OLLAMA_BASE_URL: "http://localhost:11434"
+          LOG_LEVEL: "WARNING"
+        run: python -m pytest tests/test_critical_paths.py -q --tb=short
+
+  # ── Frontend type-check ──────────────────────────────────────────────────────
+  frontend-typecheck:
+    name: Frontend — tsc
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --frozen-lockfile
+
+      - name: TypeScript type check
+        working-directory: frontend
+        # next build runs tsc internally; use tsc --noEmit for a fast standalone check.
+        run: npx tsc --noEmit
+
+  # ── Docker build smoke test ──────────────────────────────────────────────────
+  docker-build:
+    name: Docker — build backend image
+    runs-on: ubuntu-latest
+    # Only run on pushes to main and on PRs (not on every draft commit).
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build --file backend/Dockerfile --tag learning-copilot-backend:ci backend/

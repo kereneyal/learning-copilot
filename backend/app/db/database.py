@@ -1,13 +1,20 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import text
+import logging
+import os
 
-DATABASE_URL = "sqlite:///./learning_copilot.db"
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}
-)
+logger = logging.getLogger(__name__)
+
+# Read from DATABASE_URL env var; default keeps local-dev behaviour unchanged.
+# For Docker: set DATABASE_URL in docker-compose.yml or the .env file.
+# Note: SQLite works only with a single uvicorn worker (WEB_CONCURRENCY=1).
+#       Migrate to PostgreSQL before increasing workers.
+DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./learning_copilot.db")
+
+_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
+engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -29,9 +36,26 @@ def ensure_sqlite_schema():
                 conn.execute(text("ALTER TABLE documents ADD COLUMN error_type TEXT"))
             if "error_stage" not in existing:
                 conn.execute(text("ALTER TABLE documents ADD COLUMN error_stage TEXT"))
-    except Exception:
-        # Best-effort; if this fails, the app may still run on fresh DBs.
-        pass
+            if "summary_status" not in existing:
+                conn.execute(text(
+                    "ALTER TABLE documents ADD COLUMN summary_status TEXT DEFAULT 'not_started'"
+                ))
+            # Backfill: mark docs that already have a summary row as completed.
+            conn.execute(text("""
+                UPDATE documents
+                SET summary_status = 'completed'
+                WHERE id IN (SELECT document_id FROM summaries)
+                  AND (summary_status IS NULL OR summary_status = 'not_started')
+            """))
+    except Exception as exc:
+        # Best-effort — do not raise; a fresh DB will have all columns via
+        # create_all(). Log at ERROR so the failure is visible in structured logs.
+        logger.error(
+            "db.schema_migration_failed error=%s — app will continue but the "
+            "schema may be incomplete on existing databases",
+            exc,
+            exc_info=True,
+        )
 
 
 def get_db():

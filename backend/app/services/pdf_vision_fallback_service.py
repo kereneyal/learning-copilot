@@ -59,7 +59,7 @@ def _vision_single_page_png(png_bytes: bytes, page_num: int) -> Tuple[Optional[s
             max_tokens=4096,
         )
     except Exception as e:
-        logger.warning("pdf_vision: API error page=%s: %s", page_num, e)
+        logger.warning("pdf_vision: API error page=%s model=%s: %s", page_num, _VISION_MODEL, e)
         return None, str(e)
 
     choice = response.choices[0] if response.choices else None
@@ -78,25 +78,87 @@ def _vision_single_page_png(png_bytes: bytes, page_num: int) -> Tuple[Optional[s
 def extract_pdf_text_via_vision(file_path: str) -> Tuple[str, Optional[str], int]:
     """
     Returns (combined_text, error_or_none, pages_processed).
+
+    Logs a warning when the document is longer than PDF_VISION_MAX_PAGES so
+    operators can detect silent content truncation.
     """
     doc = fitz.open(file_path)
     try:
-        n = len(doc)
-        to_render = min(n, max(1, _MAX_PAGES))
+        total_pages = len(doc)
+        to_render = min(total_pages, max(1, _MAX_PAGES))
+
+        # FIX: log truncation explicitly so missing content is never silent.
+        if total_pages > to_render:
+            logger.warning(
+                "pdf_vision.truncated path=%s total_pages=%d max_pages=%d processing=%d "
+                "— pages %d-%d will NOT be indexed; increase PDF_VISION_MAX_PAGES to cover them",
+                file_path,
+                total_pages,
+                _MAX_PAGES,
+                to_render,
+                to_render + 1,
+                total_pages,
+            )
+        else:
+            logger.info(
+                "pdf_vision.start path=%s total_pages=%d to_render=%d model=%s dpi=%d",
+                file_path,
+                total_pages,
+                to_render,
+                _VISION_MODEL,
+                _RENDER_DPI,
+            )
+
         parts: list[str] = []
         last_err: Optional[str] = None
+        successful_pages = 0
+        failed_pages = 0
+
         for i in range(to_render):
             page = doc[i]
             pix = page.get_pixmap(dpi=_RENDER_DPI, alpha=False)
             png = pix.tobytes("png")
+
             txt, err = _vision_single_page_png(png, i + 1)
             if err:
                 last_err = err
-            if txt:
+                failed_pages += 1
+                logger.debug(
+                    "pdf_vision.page_failed page=%d/%d error=%s", i + 1, to_render, err
+                )
+            elif txt:
                 parts.append(txt)
+                successful_pages += 1
+                logger.debug(
+                    "pdf_vision.page_ok page=%d/%d chars=%d",
+                    i + 1,
+                    to_render,
+                    len(txt),
+                )
+            else:
+                # API returned success but empty text (blank page, pure image, etc.).
+                failed_pages += 1
+                logger.debug(
+                    "pdf_vision.page_empty page=%d/%d", i + 1, to_render
+                )
+
         combined = "\n\n".join(parts).strip()
+
+        logger.info(
+            "pdf_vision.done path=%s total_pages=%d rendered=%d successful=%d failed=%d "
+            "combined_chars=%d truncated=%s",
+            file_path,
+            total_pages,
+            to_render,
+            successful_pages,
+            failed_pages,
+            len(combined),
+            total_pages > to_render,
+        )
+
         if not combined:
             return "", last_err or "vision produced no text", to_render
+
         return combined, None, to_render
     finally:
         doc.close()

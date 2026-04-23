@@ -34,6 +34,8 @@ type Lecture = {
   notes?: string
 }
 
+type SummaryStatus = "not_started" | "pending" | "generating" | "completed" | "failed"
+
 type CourseDocument = {
   id: string
   course_id: string
@@ -47,6 +49,7 @@ type CourseDocument = {
   uploaded_at?: string
   processing_status?: string
   processing_progress?: number
+  summary_status?: SummaryStatus
   error_type?: string
   error_stage?: string
   last_error?: string
@@ -65,6 +68,7 @@ type DocumentDetails = {
   uploaded_at?: string
   processing_status?: string
   processing_progress?: number
+  summary_status?: SummaryStatus
   error_type?: string
   error_stage?: string
   last_error?: string
@@ -118,6 +122,7 @@ type SearchResultItem = {
 type DocumentStatusResponse = {
   status?: string
   progress?: number
+  summary_status?: SummaryStatus
   error?: string | null
   error_type?: string | null
   error_stage?: string | null
@@ -318,7 +323,10 @@ function getSearchTypeLabel(type: string) {
     () =>
       documents.some((d) => {
         const s = (d.processing_status || "").toLowerCase()
-        return s && s !== "ready" && s !== "failed"
+        const ss = d.summary_status || "not_started"
+        const docInFlight = s && s !== "ready" && s !== "failed"
+        const summaryInFlight = ss === "pending" || ss === "generating"
+        return docInFlight || summaryInFlight
       }),
     [documents]
   )
@@ -401,6 +409,7 @@ function getSearchTypeLabel(type: string) {
 
         const newStatus = (data?.status || current.processing_status || "processing") as string
         const newProgress = normalizeProgress(data?.progress ?? current.processing_progress ?? 0)
+        const newSummaryStatus = (data?.summary_status ?? current.summary_status ?? "not_started") as SummaryStatus
         const newError = (data?.error ?? current.last_error ?? null) as any
         const newErrorType = (data?.error_type ?? current.error_type ?? null) as any
         const newErrorStage = (data?.error_stage ?? current.error_stage ?? null) as any
@@ -413,12 +422,15 @@ function getSearchTypeLabel(type: string) {
           ...current,
           processing_status: newStatus,
           processing_progress: newProgress,
+          summary_status: newSummaryStatus,
           error_type: newErrorType || undefined,
           error_stage: newErrorStage || undefined,
           last_error: newError || undefined,
         })
 
-        if (!isNowTerminal) nextIds.push(id)
+        // Keep polling while doc is processing OR summary is still in flight.
+        const summaryInFlight = newSummaryStatus === "pending" || newSummaryStatus === "generating"
+        if (!isNowTerminal || summaryInFlight) nextIds.push(id)
       }
       return Array.from(byId.values())
     })
@@ -460,10 +472,17 @@ function getSearchTypeLabel(type: string) {
   // Cleanup on unmount
   useEffect(() => stopStatusPolling, [stopStatusPolling])
 
-  // Auto-start polling for any in-flight docs already in the list (e.g. refresh/navigation)
+  // Auto-start polling for any in-flight docs already in the list (e.g. refresh/navigation).
+  // Also picks up docs whose document processing is done but summary is still running.
   useEffect(() => {
     const inFlight = (documents || [])
-      .filter((d) => d.id && !isTerminalProcessingStatus(d.processing_status))
+      .filter((d) => {
+        if (!d.id) return false
+        const docInFlight = !isTerminalProcessingStatus(d.processing_status)
+        const ss = d.summary_status || "not_started"
+        const summaryInFlight = ss === "pending" || ss === "generating"
+        return docInFlight || summaryInFlight
+      })
       .map((d) => d.id)
     const currentlyPolling = new Set(activeStatusPollIdsRef.current || [])
     const missing = inFlight.filter((id) => !currentlyPolling.has(id))
@@ -1439,6 +1458,59 @@ useEffect(() => {
     return <span className={`rounded-full px-2 py-1 text-xs ${styles}`}>{label}</span>
   }
 
+  function renderSummaryBadge(summaryStatus?: SummaryStatus) {
+    const s = summaryStatus || "not_started"
+    if (s === "completed")
+      return (
+        <span className="ml-1 rounded-full bg-blue-100 px-2 py-1 text-xs text-blue-700">
+          סיכום ✓
+        </span>
+      )
+    if (s === "generating")
+      return (
+        <span className="ml-1 rounded-full bg-amber-100 px-2 py-1 text-xs text-amber-700">
+          סיכום…
+        </span>
+      )
+    if (s === "pending")
+      return (
+        <span className="ml-1 rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-500">
+          סיכום ממתין
+        </span>
+      )
+    if (s === "failed")
+      return (
+        <span className="ml-1 rounded-full bg-red-100 px-2 py-1 text-xs text-red-600">
+          סיכום נכשל
+        </span>
+      )
+    return null
+  }
+
+  async function retrySummary(documentId: string) {
+    try {
+      const res = await fetch(`${API_BASE}/documents/${documentId}/retry-summary`, {
+        method: "POST",
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      setDocuments((prev) =>
+        prev.map((d) =>
+          d.id === documentId
+            ? { ...d, summary_status: (data.summary_status || "pending") as SummaryStatus }
+            : d
+        )
+      )
+      startStatusPolling([documentId])
+      setToast({ message: "ניסיון סיכום מחדש הופעל", type: "success" })
+    } catch (err: any) {
+      setToast({
+        message: `שגיאה בניסיון סיכום מחדש: ${err?.message || "Unknown error"}`,
+        type: "error",
+      })
+    }
+  }
+
   function renderProcessingProgress(doc: CourseDocument) {
     const status = (doc.processing_status || "processing").toLowerCase()
     const progress =
@@ -2014,7 +2086,10 @@ useEffect(() => {
                         <td className="px-3 py-3">{doc.source_type || "unknown"}</td>
                         <td className="px-3 py-3">{doc.language || "unknown"}</td>
                         <td className="px-3 py-3">
-                          {renderStatusBadge(doc.processing_status)}
+                          <div className="flex flex-wrap items-center gap-1">
+                            {renderStatusBadge(doc.processing_status)}
+                            {renderSummaryBadge(doc.summary_status)}
+                          </div>
                           {renderProcessingProgress(doc)}
                         </td>
                         <td className="rounded-l-2xl px-3 py-3">
@@ -2419,7 +2494,21 @@ useEffect(() => {
                 <div><strong>נושא:</strong> {documentDetails.topic || "ללא נושא"}</div>
                 <div><strong>הרצאה:</strong> {documentDetails.lecture_title || "ללא הרצאה"}</div>
                 <div><strong>אורך טקסט שחולץ:</strong> {documentDetails.raw_text_length || 0} תווים</div>
-                <div><strong>האם summary קיים:</strong> {documentDetails.has_summary ? "כן" : "לא"}</div>
+
+                <div className="flex items-center gap-2">
+                  <strong>סיכום:</strong>
+                  {renderSummaryBadge(documentDetails.summary_status)}
+                  {(documentDetails.summary_status === "failed" ||
+                    documentDetails.summary_status === "not_started") && (
+                    <button
+                      type="button"
+                      onClick={() => retrySummary(documentDetails.id)}
+                      className="rounded-lg bg-blue-100 px-2 py-0.5 text-xs text-blue-700"
+                    >
+                      נסה שוב
+                    </button>
+                  )}
+                </div>
 
                 <div>
                   <div className="mb-1 font-semibold">שגיאה אחרונה</div>
@@ -2431,7 +2520,11 @@ useEffect(() => {
                 <div>
                   <div className="mb-1 font-semibold">Summary</div>
                   <div className="max-h-48 overflow-y-auto rounded-xl bg-slate-50 p-3 whitespace-pre-wrap">
-                    {documentDetails.summary_text || "לא נוצר summary"}
+                    {documentDetails.summary_status === "generating"
+                      ? "מייצר סיכום…"
+                      : documentDetails.summary_status === "pending"
+                      ? "ממתין להפעלת הסיכום"
+                      : documentDetails.summary_text || "לא נוצר summary"}
                   </div>
                 </div>
 

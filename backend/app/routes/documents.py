@@ -23,7 +23,12 @@ from app.agents.chunking_agent import ChunkingAgent
 from app.agents.summary_agent import SummaryAgent
 from app.agents.course_summary_agent import CourseSummaryAgent
 from app.agents.knowledge_map_agent import KnowledgeMapAgent
-from app.services.vector_store import VectorStoreService
+from app.services.vector_store import (
+    VectorStoreService,
+    EmbeddingError,
+    VectorStoreWriteError,
+    _EMBED_SINGLE_TIMEOUT_S,
+)
 from app.services.media_extraction_service import (
     MediaExtractionService,
     is_media_file,
@@ -36,6 +41,23 @@ router = APIRouter(prefix="/documents", tags=["Documents"])
 
 UPLOAD_DIR = "storage/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ── Upload validation constants ────────────────────────────────────────────────
+# Override MAX_UPLOAD_MB via environment variable for large-lecture deployments.
+MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+
+_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
+    # Documents
+    "pdf", "docx", "doc", "pptx", "ppt",
+    # Plain text
+    "txt", "md",
+    # Images (for vision pipeline)
+    "png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp",
+    # Video
+    "mp4", "avi", "mov", "mkv", "wmv",
+    # Audio
+    "mp3", "wav", "m4a", "aac", "ogg",
+})
 
 
 class DocumentUpdate(BaseModel):
@@ -73,19 +95,24 @@ def _set_error_fields(document: Document, error_type: Optional[str], error_stage
         setattr(document, "error_stage", error_stage)
 
 
-def _document_to_dict(doc: Document, lecture_title: Optional[str] = None):
+def _document_to_dict(
+    doc: Document,
+    lecture_title: Optional[str] = None,
+    summary: Optional["Summary"] = None,
+):
+    """
+    Convert a Document ORM object to a response dict.
+
+    Pass the pre-fetched Summary object (or None) explicitly — the Document
+    model has no SQLAlchemy relationship named 'summary', so accessing
+    doc.summary would always be None (dead code that was silently broken).
+    """
     raw_text = doc.raw_text or ""
-
-    summary_obj = None
-    if hasattr(doc, "summary"):
-        try:
-            summary_obj = doc.summary
-        except Exception:
-            summary_obj = None
-
-    has_summary = bool(summary_obj and getattr(summary_obj, "summary_text", None))
-    summary_text = getattr(summary_obj, "summary_text", "") if summary_obj else ""
-    summary_preview = (summary_text[:280] + "...") if summary_text and len(summary_text) > 280 else summary_text
+    summary_text = summary.summary_text if summary and summary.summary_text else ""
+    has_summary = bool(summary_text.strip())
+    summary_preview = (
+        (summary_text[:280] + "...") if len(summary_text) > 280 else summary_text
+    )
 
     return {
         "id": doc.id,
@@ -100,6 +127,7 @@ def _document_to_dict(doc: Document, lecture_title: Optional[str] = None):
         "uploaded_at": getattr(doc, "uploaded_at", None),
         "processing_status": getattr(doc, "processing_status", "ready"),
         "processing_progress": getattr(doc, "processing_progress", 0),
+        "summary_status": getattr(doc, "summary_status", "not_started") or "not_started",
         "error_type": getattr(doc, "error_type", None),
         "error_stage": getattr(doc, "error_stage", None),
         "last_error": getattr(doc, "last_error", None),
@@ -164,7 +192,25 @@ def _derive_error_fields(exc: Exception, fallback_stage: str):
     return "processing_error", stage_norm or "processing"
 
 
-def _refresh_course_aggregates(db: Session, course_id: str, language: str = "en"):
+def _refresh_course_aggregates(
+    db: Session,
+    course_id: str,
+    language: str = "en",
+    doc_id: str = "?",
+) -> None:
+    """
+    Rebuild course-level summary and knowledge map from all document summaries.
+
+    Both steps (course summary, knowledge map) run independently — a failure
+    in one does NOT prevent the other from running, and neither failure
+    propagates to the caller.  The caller is itself inside a best-effort
+    try/except in _run_summary_in_background.
+
+    All failures are logged with full structured context so operators can
+    diagnose which step failed, with what input size, on which provider.
+    """
+    t0 = time.time()
+
     all_summaries = (
         db.query(Summary)
         .join(Document, Summary.document_id == Document.id)
@@ -173,37 +219,200 @@ def _refresh_course_aggregates(db: Session, course_id: str, language: str = "en"
     )
 
     summaries_texts = [s.summary_text for s in all_summaries if s.summary_text]
+    n = len(summaries_texts)
+
     if not summaries_texts:
+        logger.info(
+            "aggregates_refresh.skipped doc_id=%s course_id=%s reason=no_summaries",
+            doc_id, course_id,
+        )
         return
 
-    course_summary_agent = CourseSummaryAgent()
-    course_summary_text = course_summary_agent.summarize_course(
-        summaries_texts,
-        language or "en"
+    provider = os.getenv(
+        "AGGREGATES_PROVIDER",
+        "openai" if os.getenv("OPENAI_API_KEY") else "ollama",
+    )
+    combined_chars = sum(len(s) for s in summaries_texts)
+    logger.info(
+        "aggregates_refresh.started doc_id=%s course_id=%s "
+        "summary_count=%d total_input_chars=%d provider=%s",
+        doc_id, course_id, n, combined_chars, provider,
     )
 
-    cs = CourseSummary(
-        course_id=course_id,
-        summary_text=course_summary_text,
-        language=language
-    )
-    db.add(cs)
-    db.commit()
+    # ------------------------------------------------------------------ #
+    # Step 1 — course summary.  Failure is logged and skipped; step 2     #
+    # still runs (with an empty course_summary_text as fallback input).   #
+    # ------------------------------------------------------------------ #
+    course_summary_text = ""
+    t1 = time.time()
+    try:
+        logger.info(
+            "aggregates_refresh.course_summary.started doc_id=%s course_id=%s "
+            "summaries=%d provider=%s",
+            doc_id, course_id, n, provider,
+        )
+        course_summary_agent = CourseSummaryAgent()
+        course_summary_text = course_summary_agent.summarize_course(
+            summaries_texts, language or "en"
+        )
+        db.add(CourseSummary(
+            course_id=course_id,
+            summary_text=course_summary_text,
+            language=language,
+        ))
+        db.commit()
+        logger.info(
+            "aggregates_refresh.course_summary.completed doc_id=%s course_id=%s "
+            "duration_ms=%d result_chars=%d",
+            doc_id, course_id,
+            int((time.time() - t1) * 1000),
+            len(course_summary_text),
+        )
+    except Exception as exc:
+        logger.warning(
+            "aggregates_refresh.course_summary.failed doc_id=%s course_id=%s "
+            "duration_ms=%d error=%s",
+            doc_id, course_id,
+            int((time.time() - t1) * 1000),
+            exc,
+        )
+        # Continue — knowledge map step still runs even without a course summary.
 
-    km_agent = KnowledgeMapAgent()
-    km_text = km_agent.generate_map(
-        course_summary=course_summary_text,
-        document_summaries=summaries_texts,
-        language=language or "en"
+    # ------------------------------------------------------------------ #
+    # Step 2 — knowledge map.  Independent of step 1.                     #
+    # ------------------------------------------------------------------ #
+    t2 = time.time()
+    try:
+        logger.info(
+            "aggregates_refresh.knowledge_map.started doc_id=%s course_id=%s "
+            "summaries=%d course_summary_chars=%d provider=%s",
+            doc_id, course_id, n, len(course_summary_text), provider,
+        )
+        km_agent = KnowledgeMapAgent()
+        km_text = km_agent.generate_map(
+            course_summary=course_summary_text,
+            document_summaries=summaries_texts,
+            language=language or "en",
+        )
+        db.add(KnowledgeMap(
+            course_id=course_id,
+            map_text=km_text,
+            language=language,
+        ))
+        db.commit()
+        logger.info(
+            "aggregates_refresh.knowledge_map.completed doc_id=%s course_id=%s "
+            "duration_ms=%d result_chars=%d",
+            doc_id, course_id,
+            int((time.time() - t2) * 1000),
+            len(km_text),
+        )
+    except Exception as exc:
+        logger.warning(
+            "aggregates_refresh.knowledge_map.failed doc_id=%s course_id=%s "
+            "duration_ms=%d error=%s",
+            doc_id, course_id,
+            int((time.time() - t2) * 1000),
+            exc,
+        )
+
+    logger.info(
+        "aggregates_refresh.completed doc_id=%s course_id=%s total_ms=%d",
+        doc_id, course_id, int((time.time() - t0) * 1000),
     )
 
-    km = KnowledgeMap(
-        course_id=course_id,
-        map_text=km_text,
-        language=language
-    )
-    db.add(km)
-    db.commit()
+
+def _run_summary_in_background(document_id: str) -> None:
+    """
+    Best-effort summary generation in its own thread.
+
+    The document is already marked 'ready' before this runs — summary
+    completion or failure never changes processing_status.
+
+    Ollama note: if summary_agent.summarize() raises Timeout the HTTP client
+    stops waiting, but the Ollama generation goroutine keeps running until it
+    finishes.  This is a known Ollama limitation; the document remains fully
+    searchable and usable regardless.
+    """
+    thread_db = SessionLocal()
+    t0 = time.time()
+    try:
+        doc = thread_db.query(Document).filter(Document.id == document_id).first()
+        if not doc:
+            logger.warning("summary_job.doc_not_found doc_id=%s", document_id)
+            return
+
+        doc.summary_status = "generating"
+        thread_db.commit()
+        logger.info(
+            "summary_job.started doc_id=%s provider=%s",
+            document_id,
+            os.getenv("SUMMARY_PROVIDER", "openai" if os.getenv("OPENAI_API_KEY") else "ollama"),
+        )
+
+        summary_agent = SummaryAgent()
+        summary_text = summary_agent.summarize(doc.raw_text or "", doc.language or "en")
+
+        thread_db.query(Summary).filter(
+            Summary.document_id == document_id
+        ).delete(synchronize_session=False)
+        thread_db.add(Summary(
+            document_id=document_id,
+            summary_text=summary_text,
+            language=doc.language,
+        ))
+        doc.summary_status = "completed"
+        thread_db.commit()
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+        logger.info(
+            "summary_job.completed doc_id=%s elapsed_ms=%d summary_chars=%d",
+            document_id,
+            elapsed_ms,
+            len(summary_text),
+        )
+
+        # Refresh course-level aggregates — best-effort, errors do NOT revert summary_status.
+        # _refresh_course_aggregates isolates each step internally; this outer try/except
+        # is a final safety net for unexpected failures (e.g. DB connection error).
+        try:
+            doc_fresh = thread_db.query(Document).filter(Document.id == document_id).first()
+            if doc_fresh:
+                _refresh_course_aggregates(
+                    db=thread_db,
+                    course_id=doc_fresh.course_id,
+                    language=doc_fresh.language or "en",
+                    doc_id=document_id,
+                )
+        except Exception as agg_exc:
+            logger.warning(
+                "summary_job.aggregates_unexpected_error doc_id=%s error=%s",
+                document_id,
+                agg_exc,
+            )
+
+    except Exception as exc:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        logger.warning(
+            "summary_job.failed doc_id=%s elapsed_ms=%d error=%s",
+            document_id,
+            elapsed_ms,
+            exc,
+        )
+        try:
+            doc_err = thread_db.query(Document).filter(Document.id == document_id).first()
+            if doc_err:
+                doc_err.summary_status = "failed"
+                _set_last_error(doc_err, f"summary_failed: {exc}")
+                thread_db.commit()
+        except Exception as persist_exc:
+            logger.warning(
+                "summary_job.status_persist_failed doc_id=%s error=%s",
+                document_id,
+                persist_exc,
+            )
+    finally:
+        thread_db.close()
 
 
 def _process_existing_document(db: Session, doc: Document):
@@ -284,6 +493,22 @@ def _process_existing_document(db: Session, doc: Document):
             retriable=False,
         )
 
+    # FIX: persist raw_text and language immediately after successful extraction,
+    # BEFORE chunking begins.  Previously these were only saved after chunking
+    # succeeded — a chunking failure would lose the extracted text entirely and
+    # force a full re-extraction on retry (expensive for OCR/vision documents).
+    doc.language = detected_language
+    doc.raw_text = extracted_text
+    _set_last_error(doc, None)
+    db.commit()
+    db.refresh(doc)
+    logger.info(
+        "processing.raw_text_saved doc_id=%s lang=%s text_len=%d",
+        doc.id,
+        detected_language,
+        len(extracted_text),
+    )
+
     _update_processing_state(db, doc, "chunking", 40)
     logger.info("processing.stage_start doc_id=%s stage=chunking", doc.id)
 
@@ -302,34 +527,56 @@ def _process_existing_document(db: Session, doc: Document):
             retriable=False,
         )
 
-    doc.language = detected_language
-    doc.raw_text = extracted_text
-    _set_last_error(doc, None)
-    db.commit()
-    db.refresh(doc)
-
     _update_processing_state(db, doc, "embedding", 70)
-    logger.info("processing.stage_start doc_id=%s stage=embedding", doc.id)
+    logger.info(
+        "processing.stage_start doc_id=%s stage=embedding chunks=%d embed_timeout_s=%d",
+        doc.id,
+        len(chunks),
+        _EMBED_SINGLE_TIMEOUT_S,
+    )
 
+    # No stage-level timeout for embedding — per-request timeout (_EMBED_SINGLE_TIMEOUT_S)
+    # is the only guard.  A slow CPU Ollama may take 2–3 minutes for a small file;
+    # wrapping in a wall-clock timeout causes false "failed" status for valid uploads.
     vector_store = VectorStoreService()
-
-    def _embed_and_write():
+    embed_t0 = time.time()
+    try:
         try:
             vector_store.delete_by_document_id(doc.id)
         except Exception:
             pass
-        return vector_store.add_chunks(
+
+        added = vector_store.add_chunks(
             document_id=doc.id,
             course_id=doc.course_id,
             lecture_id=getattr(doc, "lecture_id", None),
             chunks=chunks,
             embed_attempts=3,
             write_attempts=3,
-            stage_timeout_s=60,
+            embed_timeout_s=_EMBED_SINGLE_TIMEOUT_S,
+        )
+    except (EmbeddingError, VectorStoreWriteError) as exc:
+        raise ProcessingStageError(
+            stage="embedding",
+            error_type="embedding_failed",
+            message=str(exc),
+            retriable=True,
+        )
+    except Exception as exc:
+        raise ProcessingStageError(
+            stage="embedding",
+            error_type="embedding_failed",
+            message=str(exc),
+            retriable=True,
         )
 
-    added = _run_with_timeout("embedding", _embed_and_write, timeout_s=60)
-    logger.info("processing.stage_end doc_id=%s stage=embedding indexed_chunks=%s", doc.id, added)
+    embed_elapsed_ms = int((time.time() - embed_t0) * 1000)
+    logger.info(
+        "processing.stage_end doc_id=%s stage=embedding indexed_chunks=%d elapsed_ms=%d",
+        doc.id,
+        added,
+        embed_elapsed_ms,
+    )
 
     if added <= 0:
         raise ProcessingStageError(
@@ -349,43 +596,29 @@ def _process_existing_document(db: Session, doc: Document):
     _run_with_timeout("indexing", _indexing, timeout_s=60)
     logger.info("processing.stage_end doc_id=%s stage=indexing", doc.id)
 
-    summary_agent = SummaryAgent()
-    summary_text = summary_agent.summarize(
-        doc.raw_text or "",
-        doc.language or "en"
-    )
-
-    new_summary = Summary(
-        document_id=doc.id,
-        summary_text=summary_text,
-        language=doc.language
-    )
-    db.add(new_summary)
+    # Mark document ready — searchable and usable for QA from this point on.
+    _update_processing_state(db, doc, "ready", 100)
+    doc.summary_status = "pending"
     db.commit()
 
-    _update_processing_state(db, doc, "ready", 100)
-
-    aggregate_warning = None
-    try:
-        _refresh_course_aggregates(
-            db=db,
-            course_id=doc.course_id,
-            language=doc.language or "en"
-        )
-    except Exception as e:
-        aggregate_warning = str(e)
-        _set_last_error(doc, aggregate_warning)
-        _update_processing_state(db, doc, "ready", 100)
+    # Launch summary in a separate thread so ingestion returns immediately.
+    # Summary completion/failure never affects processing_status.
+    summary_thread = threading.Thread(
+        target=_run_summary_in_background,
+        args=(doc.id,),
+        daemon=True,
+    )
+    summary_thread.start()
+    logger.info("processing.summary_dispatched doc_id=%s", doc.id)
 
     return {
         "id": doc.id,
         "file_name": doc.file_name,
-        "processing_status": getattr(doc, "processing_status", "ready"),
+        "processing_status": "ready",
+        "summary_status": "pending",
         "language": doc.language,
         "chunks_count": len(chunks),
         "raw_text_preview": (doc.raw_text or "")[:500],
-        "summary_created": True,
-        "last_error": aggregate_warning or getattr(doc, "last_error", None),
     }
 
 
@@ -402,6 +635,34 @@ def _process_single_upload(
 
     safe_filename = os.path.basename(file.filename)
     file_extension = safe_filename.split(".")[-1].lower() if "." in safe_filename else "txt"
+
+    # ── Validate before touching the database ─────────────────────────────────
+    if file_extension not in _ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type '.{file_extension}'. "
+                f"Allowed types: {', '.join(sorted(_ALLOWED_EXTENSIONS))}"
+            ),
+        )
+
+    # Measure file size via seek so we never load the whole file into memory.
+    # file.file is a SpooledTemporaryFile which supports seek even for large files.
+    try:
+        file.file.seek(0, 2)          # seek to end
+        upload_size = file.file.tell()
+        file.file.seek(0)             # reset to beginning for subsequent reads
+    except Exception:
+        upload_size = 0               # can't determine — allow through, disk will cap it
+
+    if upload_size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large ({upload_size // (1024 * 1024)} MB). "
+                f"Maximum allowed size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+            ),
+        )
 
     new_document = Document(
         course_id=course_id,
@@ -558,9 +819,8 @@ def get_document_status(document_id: str, db: Session = Depends(get_db)):
     return {
         "status": getattr(doc, "processing_status", "ready"),
         "progress": getattr(doc, "processing_progress", 0) or 0,
-        # Keep existing contract field name and value: technical error string (frontend hides by default)
+        "summary_status": getattr(doc, "summary_status", "not_started") or "not_started",
         "error": getattr(doc, "last_error", None),
-        # Add structured fields (non-breaking additions)
         "error_type": getattr(doc, "error_type", None),
         "error_stage": getattr(doc, "error_stage", None),
     }
@@ -585,38 +845,98 @@ def retry_processing(document_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Retry processing failed: {str(e)}")
 
 
+@router.post("/{document_id}/retry-summary")
+def retry_summary(document_id: str, db: Session = Depends(get_db)):
+    """
+    Re-dispatch summary generation for a document that is already ready.
+    Safe to call when summary_status is 'failed' or 'not_started'.
+    Returns immediately; summary runs in a background thread.
+    """
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if not getattr(doc, "raw_text", None):
+        raise HTTPException(
+            status_code=400,
+            detail="Document has no raw_text — run full processing first",
+        )
+
+    current = getattr(doc, "summary_status", "not_started") or "not_started"
+    if current == "generating":
+        return {"status": "already_generating", "summary_status": "generating"}
+
+    doc.summary_status = "pending"
+    _set_last_error(doc, None)
+    db.commit()
+
+    t = threading.Thread(
+        target=_run_summary_in_background,
+        args=(document_id,),
+        daemon=True,
+    )
+    t.start()
+    logger.info("summary_job.retry_dispatched doc_id=%s", document_id)
+    return {"status": "dispatched", "summary_status": "pending"}
+
+
+def _batch_lecture_titles(db: Session, lecture_ids) -> dict:
+    """Return {lecture_id: title} for a collection of IDs in one query."""
+    ids = [lid for lid in lecture_ids if lid]
+    if not ids:
+        return {}
+    rows = db.query(Lecture.id, Lecture.title).filter(Lecture.id.in_(ids)).all()
+    return {row.id: row.title for row in rows}
+
+
+def _batch_summaries(db: Session, document_ids) -> dict:
+    """Return {document_id: Summary} for a collection of doc IDs in one query."""
+    ids = [did for did in document_ids if did]
+    if not ids:
+        return {}
+    rows = db.query(Summary).filter(Summary.document_id.in_(ids)).all()
+    # One summary per document; keep the first if duplicates exist.
+    out = {}
+    for row in rows:
+        if row.document_id not in out:
+            out[row.document_id] = row
+    return out
+
+
 @router.get("/course/{course_id}")
 def get_documents_by_course(course_id: str, db: Session = Depends(get_db)):
     documents = db.query(Document).filter(Document.course_id == course_id).all()
-    result = []
 
-    for doc in documents:
-        lecture_title = None
-        if getattr(doc, "lecture_id", None):
-            lecture = db.query(Lecture).filter(Lecture.id == doc.lecture_id).first()
-            if lecture:
-                lecture_title = lecture.title
+    # FIX: single batch query for all lectures and summaries instead of N+1.
+    lecture_titles = _batch_lecture_titles(db, (d.lecture_id for d in documents))
+    summaries = _batch_summaries(db, (d.id for d in documents))
 
-        result.append(_document_to_dict(doc, lecture_title=lecture_title))
-
-    return result
+    return [
+        _document_to_dict(
+            doc,
+            lecture_title=lecture_titles.get(doc.lecture_id),
+            summary=summaries.get(doc.id),
+        )
+        for doc in documents
+    ]
 
 
 @router.get("/lecture/{lecture_id}")
 def get_documents_by_lecture(lecture_id: str, db: Session = Depends(get_db)):
     documents = db.query(Document).filter(Document.lecture_id == lecture_id).all()
-    result = []
 
-    for doc in documents:
-        lecture_title = None
-        if getattr(doc, "lecture_id", None):
-            lecture = db.query(Lecture).filter(Lecture.id == doc.lecture_id).first()
-            if lecture:
-                lecture_title = lecture.title
+    # FIX: single batch query for all lectures and summaries instead of N+1.
+    lecture_titles = _batch_lecture_titles(db, (d.lecture_id for d in documents))
+    summaries = _batch_summaries(db, (d.id for d in documents))
 
-        result.append(_document_to_dict(doc, lecture_title=lecture_title))
-
-    return result
+    return [
+        _document_to_dict(
+            doc,
+            lecture_title=lecture_titles.get(doc.lecture_id),
+            summary=summaries.get(doc.id),
+        )
+        for doc in documents
+    ]
 
 
 @router.get("/{document_id}")
@@ -649,6 +969,7 @@ def get_document_details(document_id: str, db: Session = Depends(get_db)):
         "uploaded_at": getattr(doc, "uploaded_at", None),
         "processing_status": getattr(doc, "processing_status", "ready"),
         "processing_progress": getattr(doc, "processing_progress", 0),
+        "summary_status": getattr(doc, "summary_status", "not_started") or "not_started",
         "last_error": getattr(doc, "last_error", None),
         "has_summary": bool(summary_text.strip()),
         "summary_text": summary_text,
@@ -681,7 +1002,8 @@ def update_document(document_id: str, payload: DocumentUpdate, db: Session = Dep
         if lecture:
             lecture_title = lecture.title
 
-    return _document_to_dict(doc, lecture_title=lecture_title)
+    summary = db.query(Summary).filter(Summary.document_id == doc.id).first()
+    return _document_to_dict(doc, lecture_title=lecture_title, summary=summary)
 
 
 @router.delete("/{document_id}")

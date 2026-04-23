@@ -1,0 +1,33 @@
+# Python runtime artifacts
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test artifacts
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data — mounted as Docker volumes at runtime, never baked into images
+chroma_db/
+storage/
+*.db
+backups/
+
+# Dev tooling
+.git/
+.gitignore
+.env
+*.sh
+archive/
+*_backup_clean/
+scripts/
+
+# Editor
+.vscode/
+.idea/
+*.swp

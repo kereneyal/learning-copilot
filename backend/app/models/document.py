@@ -27,5 +27,6 @@ class Document(Base):
     error_type = Column(String, nullable=True)
     error_stage = Column(String, nullable=True)
     last_error = Column(Text, nullable=True)
+    summary_status = Column(String, nullable=True, default="not_started")
 
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now())

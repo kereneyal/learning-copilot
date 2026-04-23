@@ -1,0 +1,87 @@
+version: "3.9"
+
+# ── Learning Copilot — local / staging compose ───────────────────────────────
+#
+# Usage:
+#   docker compose up --build          # start everything
+#   docker compose up backend          # backend only (Ollama must be separate)
+#   docker compose logs -f backend     # stream backend logs
+#
+# Pull required Ollama models after first start:
+#   docker compose exec ollama ollama pull nomic-embed-text
+#   docker compose exec ollama ollama pull qwen2:0.5b
+#
+# Production:
+#   Override CORS_ORIGINS and NEXT_PUBLIC_API_BASE_URL with real domains.
+#   Mount chroma_db, storage, and learning_copilot.db on durable volumes.
+
+services:
+
+  # ── Ollama ─────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Backend ────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      # Override so the backend reaches Ollama via the compose network.
+      OLLAMA_BASE_URL: http://ollama:11434
+      # Readable logs when tailing via `docker compose logs`.
+      LOG_FORMAT: text
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+    volumes:
+      # Persist the SQLite DB and vector store across container restarts.
+      - backend_db:/app/learning_copilot.db
+      - backend_chroma:/app/chroma_db
+      - backend_storage:/app/storage
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the Next.js bundle at build time.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  backend_db:
+  backend_chroma:
+  backend_storage:

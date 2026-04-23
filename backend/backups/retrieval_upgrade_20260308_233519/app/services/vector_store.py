@@ -14,16 +14,16 @@ class VectorStoreService:
 
         for text in texts:
             response = requests.post(
-                f"{self.ollama_base_url}/api/embeddings",
+                f"{self.ollama_base_url}/api/embed",
                 json={
                     "model": self.embedding_model,
-                    "prompt": text
+                    "input": text
                 },
                 timeout=120
             )
             response.raise_for_status()
             data = response.json()
-            embeddings.append(data["embedding"])
+            embeddings.append(data["embeddings"][0])
 
         return embeddings
 
