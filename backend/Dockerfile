@@ -42,16 +42,17 @@ RUN mkdir -p /app/storage/uploads /app/storage/syllabus /app/chroma_db
 
 EXPOSE 8000
 
-# LOG_FORMAT=text gives readable output in Docker logs; switch to json for
-# log aggregation pipelines (Loki, CloudWatch, etc.).
-ENV LOG_FORMAT=text \
-    LOG_LEVEL=INFO \
-    # Worker count — KEEP AT 1 while using SQLite + ChromaDB PersistentClient.
-    # Multiple processes share the same SQLite file and ChromaDB file lock,
-    # which causes contention under concurrent writes.
-    # Increase only after migrating to PostgreSQL + ChromaDB HTTP server.
-    WEB_CONCURRENCY=1
+# LOG_FORMAT=text gives readable output in `docker compose logs`.
+# Switch to json for log aggregation pipelines (Loki, CloudWatch, etc.).
+ENV LOG_FORMAT=text
+ENV LOG_LEVEL=INFO
 
-# Use a shell wrapper so WEB_CONCURRENCY is expanded at container start time
-# (ENV variables are not expanded in the JSON exec form of CMD).
+# WEB_CONCURRENCY: keep at 1 while using SQLite + ChromaDB PersistentClient.
+# Multiple processes share the same SQLite file and ChromaDB file lock,
+# which causes contention under concurrent writes.
+# Increase only after migrating to PostgreSQL + ChromaDB HTTP server.
+ENV WEB_CONCURRENCY=1
+
+# Use a shell form so $WEB_CONCURRENCY is expanded at container start time.
+# (ENV variables are not expanded inside the JSON exec form of CMD.)
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY}"]

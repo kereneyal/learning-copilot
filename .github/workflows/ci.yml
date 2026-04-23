@@ -22,14 +22,10 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
-      - name: Install system dependencies
-        # Tesseract is required by pdf_ocr_service; libgl1 by PyMuPDF.
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            tesseract-ocr \
-            libgl1-mesa-glx \
-            libglib2.0-0
+      # Note: no system packages needed here.
+      # conftest.py stubs all native dependencies (fitz/PyMuPDF, pytesseract,
+      # PIL, chromadb, sentence_transformers) before any app module is imported,
+      # so the test suite runs without any system-level install.
 
       - name: Install Python dependencies
         working-directory: backend
@@ -66,14 +62,12 @@ jobs:
 
       - name: TypeScript type check
         working-directory: frontend
-        # next build runs tsc internally; use tsc --noEmit for a fast standalone check.
         run: npx tsc --noEmit
 
   # ── Docker build smoke test ──────────────────────────────────────────────────
   docker-build:
     name: Docker — build backend image
     runs-on: ubuntu-latest
-    # Only run on pushes to main and on PRs (not on every draft commit).
     if: github.event_name == 'push' || github.event.pull_request.draft == false
 
     steps:
