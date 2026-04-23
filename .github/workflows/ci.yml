@@ -20,7 +20,10 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          # Cache key covers both files so a change to either invalidates the cache.
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
 
       # Note: no system packages needed here.
       # conftest.py stubs all native dependencies (fitz/PyMuPDF, pytesseract,
@@ -29,7 +32,7 @@ jobs:
 
       - name: Install Python dependencies
         working-directory: backend
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run tests
         working-directory: backend

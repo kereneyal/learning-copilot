@@ -1,0 +1,4 @@
+# Development / CI dependencies — not installed in production images.
+# Install alongside the main requirements:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest>=7.1.2
