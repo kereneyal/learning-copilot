@@ -168,6 +168,7 @@ export default function ChatWorkspace() {
   const [input, setInput] = useState("")
   const [sending, setSending] = useState(false)
   const [error, setError] = useState("")
+  const [loadError, setLoadError] = useState("")
   const [imageExtractError, setImageExtractError] = useState("")
   const [imageExtractSuccessHint, setImageExtractSuccessHint] = useState("")
   const [imageExtracting, setImageExtracting] = useState(false)
@@ -230,19 +231,55 @@ export default function ChatWorkspace() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
+  function extractList<T>(body: unknown): T[] {
+    if (Array.isArray(body)) return body as T[]
+    if (body !== null && typeof body === "object") {
+      const b = body as Record<string, unknown>
+      if (Array.isArray(b.data)) return b.data as T[]
+      if (b.data !== null && typeof b.data === "object") {
+        const d = b.data as Record<string, unknown>
+        if (Array.isArray(d.items)) return d.items as T[]
+      }
+    }
+    return []
+  }
+
   async function fetchCourses() {
-    const res = await fetch(`${API_BASE}/courses/`)
-    const data = await res.json()
-    setCourses(data)
-    if (data.length > 0 && !selectedCourseId) {
-      setSelectedCourseId(data[0].id)
+    try {
+      const res = await fetch(`${API_BASE}/courses/`)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchCourses: HTTP ${res.status}`, text)
+        setLoadError("שגיאה בטעינת קורסים")
+        return
+      }
+      const body = await res.json()
+      const list = extractList<Course>(body)
+      setCourses(list)
+      if (list.length > 0 && !selectedCourseId) {
+        setSelectedCourseId(list[0].id)
+      }
+    } catch (err) {
+      console.error("fetchCourses:", err)
+      setLoadError("שגיאת רשת — לא ניתן לטעון קורסים. בדוק ש-NEXT_PUBLIC_API_BASE_URL נכון ושהשרת פועל.")
     }
   }
 
   async function fetchLectures(courseId: string) {
-    const res = await fetch(`${API_BASE}/lectures/course/${courseId}`)
-    const data = await res.json()
-    setLectures(data)
+    try {
+      const res = await fetch(`${API_BASE}/lectures/course/${courseId}`)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchLectures: HTTP ${res.status}`, text)
+        setLectures([])
+        return
+      }
+      const body = await res.json()
+      setLectures(extractList<Lecture>(body))
+    } catch (err) {
+      console.error("fetchLectures:", err)
+      setLectures([])
+    }
   }
 
   function getSourceTypeLabel(type?: string) {
@@ -609,6 +646,11 @@ export default function ChatWorkspace() {
 
   return (
     <div className="space-y-6">
+      {loadError && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-amber-800 text-sm">
+          {loadError}
+        </div>
+      )}
       <CourseContextBar
         selectedCourse={selectedCourse}
         selectedLecture={selectedLecture}
