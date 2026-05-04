@@ -646,15 +646,33 @@ useEffect(() => {
     return () => clearInterval(interval)
   }, [hasProcessingDocuments, selectedLectureId, selectedCourseId])
 
+  function extractList<T>(body: unknown): T[] {
+    if (Array.isArray(body)) return body as T[]
+    if (body !== null && typeof body === "object") {
+      const b = body as Record<string, unknown>
+      if (Array.isArray(b.data)) return b.data as T[]
+      if (b.data !== null && typeof b.data === "object") {
+        const d = b.data as Record<string, unknown>
+        if (Array.isArray(d.items)) return d.items as T[]
+      }
+    }
+    return []
+  }
+
   async function fetchCourses() {
     try {
       setLoading(true)
       const res = await fetch(`${API_BASE}/courses/`)
-      if (!res.ok) throw new Error()
-      const data = await res.json()
-      setCourses(data)
-      if (data.length > 0 && !selectedCourseId) {
-        setSelectedCourseId(data[0].id)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchCourses: HTTP ${res.status}`, text)
+        throw new Error()
+      }
+      const body = await res.json()
+      const list = extractList<Course>(body)
+      setCourses(list)
+      if (list.length > 0 && !selectedCourseId) {
+        setSelectedCourseId(list[0].id)
       }
     } catch {
       setToast({ message: "שגיאה בטעינת קורסים", type: "error" })
@@ -666,9 +684,13 @@ useEffect(() => {
   async function fetchLecturers() {
     try {
       const res = await fetch(`${API_BASE}/lecturers/`)
-      if (!res.ok) throw new Error()
-      const data = await res.json()
-      setLecturers(data)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchLecturers: HTTP ${res.status}`, text)
+        throw new Error()
+      }
+      const body = await res.json()
+      setLecturers(extractList<Lecturer>(body))
     } catch {
       setToast({ message: "שגיאה בטעינת מרצים", type: "error" })
     }
@@ -677,9 +699,13 @@ useEffect(() => {
   async function fetchLectures(courseId: string) {
     try {
       const res = await fetch(`${API_BASE}/lectures/course/${courseId}`)
-      if (!res.ok) throw new Error()
-      const data = await res.json()
-      setLectures(data)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchLectures: HTTP ${res.status}`, text)
+        throw new Error()
+      }
+      const body = await res.json()
+      setLectures(extractList<Lecture>(body))
     } catch {
       setToast({ message: "שגיאה בטעינת הרצאות", type: "error" })
     }
@@ -688,9 +714,13 @@ useEffect(() => {
   async function fetchDocumentsByCourse(courseId: string, showErrorToast = true) {
     try {
       const res = await fetch(`${API_BASE}/documents/course/${courseId}`)
-      if (!res.ok) throw new Error()
-      const data = await res.json()
-      setDocuments(data)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchDocumentsByCourse: HTTP ${res.status}`, text)
+        throw new Error()
+      }
+      const body = await res.json()
+      setDocuments(extractList<CourseDocument>(body))
       setSelectedDocumentIds([])
     } catch {
       if (showErrorToast) setToast({ message: "שגיאה בטעינת מסמכים", type: "error" })
@@ -700,9 +730,13 @@ useEffect(() => {
   async function fetchDocumentsByLecture(lectureId: string, showErrorToast = true) {
     try {
       const res = await fetch(`${API_BASE}/documents/lecture/${lectureId}`)
-      if (!res.ok) throw new Error()
-      const data = await res.json()
-      setDocuments(data)
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        console.error(`fetchDocumentsByLecture: HTTP ${res.status}`, text)
+        throw new Error()
+      }
+      const body = await res.json()
+      setDocuments(extractList<CourseDocument>(body))
       setSelectedDocumentIds([])
     } catch {
       if (showErrorToast) setToast({ message: "שגיאה בטעינת מסמכי הרצאה", type: "error" })
